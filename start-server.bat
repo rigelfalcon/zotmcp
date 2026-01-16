@@ -2,8 +2,9 @@
 setlocal enabledelayedexpansion
 
 :: ZotMCP Server Launcher
-:: Usage: start-server.bat [mode] [port] [host]
+:: Usage: start-server.bat [mode] [semantic] [port] [host]
 ::   mode: stdio (default), http, sse
+::   semantic: true/false (default: true) - enable semantic search
 ::   port: 8765 (default for http/sse)
 ::   host: 0.0.0.0 (default for http/sse)
 
@@ -11,16 +12,25 @@ set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
 set "MODE=%~1"
-set "PORT=%~2"
-set "HOST=%~3"
+set "SEMANTIC=%~2"
+set "PORT=%~3"
+set "HOST=%~4"
 
 if "%MODE%"=="" set "MODE=stdio"
+if "%SEMANTIC%"=="" set "SEMANTIC=true"
 if "%PORT%"=="" set "PORT=8765"
 if "%HOST%"=="" set "HOST=0.0.0.0"
+
+:: Set semantic search environment variable
+set "ZOTERO_SEMANTIC_ENABLED=%SEMANTIC%"
 
 echo ============================================
 echo   ZotMCP Server Launcher
 echo ============================================
+echo.
+echo Mode: %MODE%
+echo Semantic Search: %SEMANTIC%
+if not "%MODE%"=="stdio" echo Port: %PORT%  Host: %HOST%
 echo.
 
 :: Check if .venv exists
@@ -68,10 +78,12 @@ echo ============================================
 
 if "%MODE%"=="stdio" (
     echo Starting in STDIO mode (for Claude Desktop/Code)
+    echo Semantic Search: %SEMANTIC%
     echo ============================================
     .venv\Scripts\python.exe -m zotmcp.cli serve --transport stdio
 ) else (
     echo Starting HTTP server on %HOST%:%PORT%
+    echo Semantic Search: %SEMANTIC%
     echo.
     echo Remote access endpoints:
     echo   Health:  http://%HOST%:%PORT%/health
