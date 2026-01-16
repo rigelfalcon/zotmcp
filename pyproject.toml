@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zotmcp"
+version = "0.1.0"
+description = "Professional Zotero MCP Server with remote access, semantic search, and resource safety"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "ZotMCP Contributors" },
+]
+keywords = ["zotero", "mcp", "claude", "research", "bibliography", "semantic-search"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "fastmcp>=2.0.0",
+    "pyzotero>=1.5.0",
+    "httpx>=0.25.0",
+    "aiohttp>=3.9.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "click>=8.0.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "pytest-timeout>=2.0.0",
+    "memory-profiler>=0.60.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0"
+]
+semantic = [
+    "chromadb>=0.4.0",
+    "sentence-transformers>=2.2.0",
+]
+[project.scripts]
+zotmcp = "zotmcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/user/zotmcp"
+Repository = "https://github.com/user/zotmcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zotmcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+timeout = 30
