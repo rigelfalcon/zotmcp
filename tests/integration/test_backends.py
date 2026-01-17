@@ -20,15 +20,13 @@ async def test_local_client_connection():
 async def test_web_client_requires_credentials():
     """Test web client requires API key."""
     config = ZoteroConfig(mode="web", api_key=None)
-    client = create_client(config)
 
-    # Should handle missing credentials gracefully
-    available = await client.is_available()
-    assert available is False
+    # Should raise ValueError when credentials are missing
+    with pytest.raises(ValueError, match="Web API requires api_key"):
+        create_client(config)
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(True, reason="Requires actual Zotero instance")
 async def test_search_items():
     """Test searching items (requires running Zotero)."""
     config = ZoteroConfig(mode="local")
@@ -43,7 +41,6 @@ async def test_search_items():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(True, reason="Requires actual Zotero instance")
 async def test_get_collections():
     """Test getting collections (requires running Zotero)."""
     config = ZoteroConfig(mode="local")

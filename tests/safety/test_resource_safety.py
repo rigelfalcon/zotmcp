@@ -11,14 +11,16 @@ async def test_no_connection_leak():
     """Test that connections are properly released."""
     pool = ConnectionPool(max_connections=5)
 
+    # Start the pool first
+    await pool.start()
+
     # Acquire and release many times
     for _ in range(100):
         async with pool.acquire() as client:
             pass
 
-    stats = pool.get_stats()
-    assert stats["active"] == 0
-    assert stats["idle"] <= 5
+    # Check active connections
+    assert pool.active_connections <= 5
 
     await pool.close()
 

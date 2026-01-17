@@ -103,11 +103,9 @@ async def server_lifespan(server: FastMCP):
     if semantic_engine:
         try:
             await semantic_engine.initialize()
-            sys.stderr.write("Semantic search engine initialized.
-")
+            sys.stderr.write("Semantic search engine initialized.\n")
         except Exception as e:
-            sys.stderr.write(f"Warning: Failed to initialize semantic engine: {e}
-")
+            sys.stderr.write(f"Warning: Failed to initialize semantic engine: {e}\n")
 
     yield {}
 

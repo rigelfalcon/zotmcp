@@ -43,28 +43,30 @@ async def test_paginated_iterator_truncation():
 @pytest.mark.asyncio
 async def test_streaming_fulltext():
     """Test streaming text in chunks."""
-    text = "A" * 10000
+    text = b"A" * 10000  # Use bytes instead of string
 
-    async def fetch_text():
-        return text
+    async def fetch_chunk(offset: int, size: int) -> bytes:
+        """Fetch a chunk of text at given offset."""
+        return text[offset : offset + size]
 
-    stream = StreamingFullText(fetch_text, chunk_size=1000)
+    stream = StreamingFullText(fetch_chunk, total_size=len(text), chunk_size=1000)
 
     chunks = []
     async for chunk in stream:
         chunks.append(chunk)
 
     assert len(chunks) == 10
-    assert "".join(chunks) == text
+    assert b"".join(chunks) == text
 
 
 @pytest.mark.asyncio
 async def test_streaming_empty():
     """Test streaming empty text."""
-    async def fetch_text():
-        return ""
+    async def fetch_chunk(offset: int, size: int) -> bytes:
+        """Return empty bytes."""
+        return b""
 
-    stream = StreamingFullText(fetch_text)
+    stream = StreamingFullText(fetch_chunk, total_size=0)
 
     chunks = []
     async for chunk in stream:
