@@ -316,7 +316,13 @@ class HTTPTransport:
         data: Any,
     ):
         """Send an SSE event."""
-        message = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+        # For strings, use raw value to avoid extra quotes from json.dumps
+        if isinstance(data, str):
+            data_str = data
+        else:
+            data_str = json.dumps(data)
+
+        message = f"event: {event}\ndata: {data_str}\n\n"
         await response.write(message.encode("utf-8"))
 
     async def broadcast_event(self, event: str, data: Any):

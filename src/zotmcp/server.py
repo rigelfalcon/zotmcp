@@ -2,12 +2,17 @@
 MCP Server implementation with all Zotero tools.
 """
 
+import base64
 import json
 import logging
+import shutil
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Optional
+from urllib.parse import quote
 
+import httpx
 from fastmcp import Context, FastMCP
 
 from zotmcp.clients import ZoteroClientBase, ZoteroItem, create_client
@@ -867,6 +872,487 @@ async def update_embeddings(
     stats = engine.get_stats()
 
     return f"Embedded {count} items. Total in index: {stats.get('count', 'unknown')}"
+
+
+# =============================================================================
+# Everything Integration Tools (Local File Search)
+# =============================================================================
+
+EVERYTHING_API_URL = "http://localhost:9090"
+
+
+async def _everything_search(
+    query: str,
+    count: int = 10,
+    ext: Optional[str] = None,
+) -> list[dict]:
+    """
+    Search files using Everything HTTP API.
+
+    Args:
+        query: Search query
+        count: Max results
+        ext: File extension filter (e.g., "pdf")
+
+    Returns:
+        List of file results with name and path
+    """
+    search_query = query
+    if ext:
+        search_query = f"{query} ext:{ext}"
+
+    params = {
+        "search": search_query,
+        "count": count,
+        "json": 1,
+        "path_column": 1,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"{EVERYTHING_API_URL}/?search={quote(search_query)}&count={count}&json=1&path_column=1"
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("results", [])
+    except httpx.ConnectError:
+        return []
+    except Exception as e:
+        logger.warning(f"Everything search failed: {e}")
+        return []
+
+
+@mcp.tool(
+    name="zotero_find_pdf",
+    description="Find PDF files on local disk using Everything search. Searches by author names, title keywords, or year. Requires Everything HTTP server enabled on localhost:9090."
+)
+async def find_pdf_files(
+    query: str,
+    limit: int = 10,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Find PDF files using Everything local search.
+
+    Args:
+        query: Search query (author names, title keywords, year)
+        limit: Maximum results (default: 10)
+        ctx: MCP context
+
+    Returns:
+        List of matching PDF files with full paths
+    """
+    ctx.info(f"Searching local files for: {query}")
+
+    results = await _everything_search(query, count=limit, ext="pdf")
+
+    if not results:
+        return f"No PDF files found matching: '{query}'\n\nNote: Ensure Everything HTTP server is enabled (Tools > Options > HTTP Server > Enable, Port 9090)"
+
+    output = [f"# PDF Files Found for '{query}'", f"Found {len(results)} files:", ""]
+
+    for i, result in enumerate(results, 1):
+        name = result.get("name", "Unknown")
+        path = result.get("path", "Unknown")
+        full_path = f"{path}\\{name}" if path else name
+        output.append(f"### {i}. {name}")
+        output.append(f"**Path:** `{full_path}`")
+        output.append("")
+
+    return "\n".join(output)
+
+
+@mcp.tool(
+    name="zotero_copy_pdf",
+    description="Search for PDF files using Everything and copy them to a target directory. Useful for collecting reference papers. Requires Everything HTTP server enabled on localhost:9090."
+)
+async def copy_pdf_files(
+    query: str,
+    target_dir: str,
+    new_filename: Optional[str] = None,
+    limit: int = 1,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Search and copy PDF files to a target directory.
+
+    Args:
+        query: Search query (author names, title keywords)
+        target_dir: Target directory path
+        new_filename: Optional new filename (without .pdf extension)
+        limit: Number of files to copy (default: 1, copies first match)
+        ctx: MCP context
+
+    Returns:
+        Success/failure message with copied file paths
+    """
+    ctx.info(f"Searching and copying PDFs for: {query}")
+
+    # Validate target directory
+    target_path = Path(target_dir)
+    if not target_path.exists():
+        try:
+            target_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"Error: Cannot create target directory: {e}"
+
+    # Search for files
+    results = await _everything_search(query, count=limit, ext="pdf")
+
+    if not results:
+        return f"No PDF files found matching: '{query}'"
+
+    copied = []
+    failed = []
+
+    for i, result in enumerate(results):
+        name = result.get("name", "")
+        path = result.get("path", "")
+
+        if not name or not path:
+            continue
+
+        source_path = Path(path) / name
+
+        # Determine target filename
+        if new_filename and len(results) == 1:
+            target_name = f"{new_filename}.pdf" if not new_filename.endswith(".pdf") else new_filename
+        else:
+            target_name = name
+
+        dest_path = target_path / target_name
+
+        try:
+            shutil.copy2(str(source_path), str(dest_path))
+            copied.append({
+                "source": str(source_path),
+                "dest": str(dest_path),
+            })
+        except Exception as e:
+            failed.append({
+                "source": str(source_path),
+                "error": str(e),
+            })
+
+    # Build output
+    output = [f"# PDF Copy Results for '{query}'", ""]
+
+    if copied:
+        output.append(f"## Successfully Copied ({len(copied)} files)")
+        for item in copied:
+            output.append(f"- `{item['dest']}`")
+            output.append(f"  (from: `{item['source']}`)")
+        output.append("")
+
+    if failed:
+        output.append(f"## Failed ({len(failed)} files)")
+        for item in failed:
+            output.append(f"- `{item['source']}`")
+            output.append(f"  Error: {item['error']}")
+
+    return "\n".join(output)
+
+
+@mcp.tool(
+    name="zotero_batch_copy_pdfs",
+    description="Batch search and copy multiple PDFs to a target directory based on a list of search queries. Each query finds and copies one PDF."
+)
+async def batch_copy_pdfs(
+    queries: list[str],
+    target_dir: str,
+    filenames: Optional[list[str]] = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Batch copy multiple PDFs.
+
+    Args:
+        queries: List of search queries (one per PDF)
+        target_dir: Target directory path
+        filenames: Optional list of new filenames (parallel to queries)
+        ctx: MCP context
+
+    Returns:
+        Summary of copied files
+    """
+    ctx.info(f"Batch copying {len(queries)} PDFs")
+
+    # Validate target directory
+    target_path = Path(target_dir)
+    if not target_path.exists():
+        try:
+            target_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"Error: Cannot create target directory: {e}"
+
+    results_summary = []
+    success_count = 0
+    fail_count = 0
+
+    for i, query in enumerate(queries):
+        new_filename = filenames[i] if filenames and i < len(filenames) else None
+
+        # Search for file
+        results = await _everything_search(query, count=1, ext="pdf")
+
+        if not results:
+            results_summary.append(f"- **{query}**: Not found")
+            fail_count += 1
+            continue
+
+        result = results[0]
+        name = result.get("name", "")
+        path = result.get("path", "")
+
+        if not name or not path:
+            results_summary.append(f"- **{query}**: Invalid result")
+            fail_count += 1
+            continue
+
+        source_path = Path(path) / name
+
+        # Determine target filename
+        if new_filename:
+            target_name = f"{new_filename}.pdf" if not new_filename.endswith(".pdf") else new_filename
+        else:
+            target_name = name
+
+        dest_path = target_path / target_name
+
+        try:
+            shutil.copy2(str(source_path), str(dest_path))
+            results_summary.append(f"- **{query}**: Copied to `{target_name}`")
+            success_count += 1
+        except Exception as e:
+            results_summary.append(f"- **{query}**: Failed - {e}")
+            fail_count += 1
+
+    output = [
+        "# Batch PDF Copy Results",
+        f"**Target:** `{target_dir}`",
+        f"**Success:** {success_count} | **Failed:** {fail_count}",
+        "",
+        "## Details",
+    ]
+    output.extend(results_summary)
+
+    return "\n".join(output)
+
+
+# =============================================================================
+# Remote File Transfer Tools (for LAN clients)
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_get_pdf_base64",
+    description="Search for a PDF using Everything and return its content as base64-encoded string. Enables remote clients to download PDFs from the server. Max file size: 50MB."
+)
+async def get_pdf_base64(
+    query: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Search for a PDF and return its content as base64.
+
+    Args:
+        query: Search query (author names, title keywords)
+        ctx: MCP context
+
+    Returns:
+        JSON with filename and base64 content, or error message
+    """
+    ctx.info(f"Fetching PDF as base64 for: {query}")
+
+    # Search for file
+    results = await _everything_search(query, count=1, ext="pdf")
+
+    if not results:
+        return json.dumps({"error": f"No PDF found matching: '{query}'"})
+
+    result = results[0]
+    name = result.get("name", "")
+    path = result.get("path", "")
+
+    if not name or not path:
+        return json.dumps({"error": "Invalid search result"})
+
+    source_path = Path(path) / name
+
+    if not source_path.exists():
+        return json.dumps({"error": f"File not found: {source_path}"})
+
+    # Check file size (max 50MB)
+    file_size = source_path.stat().st_size
+    max_size = 50 * 1024 * 1024  # 50MB
+
+    if file_size > max_size:
+        return json.dumps({
+            "error": f"File too large: {file_size / 1024 / 1024:.1f}MB (max 50MB)",
+            "filename": name,
+            "path": str(source_path),
+        })
+
+    try:
+        with open(source_path, "rb") as f:
+            content = base64.b64encode(f.read()).decode("utf-8")
+
+        return json.dumps({
+            "success": True,
+            "filename": name,
+            "path": str(source_path),
+            "size_bytes": file_size,
+            "content_base64": content,
+        })
+    except Exception as e:
+        return json.dumps({"error": f"Failed to read file: {e}"})
+
+
+@mcp.tool(
+    name="zotero_batch_get_pdfs_base64",
+    description="Batch search and return multiple PDFs as base64. Each query returns one PDF. For remote clients to download multiple files."
+)
+async def batch_get_pdfs_base64(
+    queries: list[str],
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Batch get multiple PDFs as base64.
+
+    Args:
+        queries: List of search queries
+        ctx: MCP context
+
+    Returns:
+        JSON array with results for each query
+    """
+    ctx.info(f"Batch fetching {len(queries)} PDFs as base64")
+
+    results = []
+    max_size = 50 * 1024 * 1024  # 50MB per file
+
+    for query in queries:
+        search_results = await _everything_search(query, count=1, ext="pdf")
+
+        if not search_results:
+            results.append({
+                "query": query,
+                "error": "Not found",
+            })
+            continue
+
+        result = search_results[0]
+        name = result.get("name", "")
+        path = result.get("path", "")
+
+        if not name or not path:
+            results.append({
+                "query": query,
+                "error": "Invalid result",
+            })
+            continue
+
+        source_path = Path(path) / name
+
+        if not source_path.exists():
+            results.append({
+                "query": query,
+                "error": "File not found",
+            })
+            continue
+
+        file_size = source_path.stat().st_size
+
+        if file_size > max_size:
+            results.append({
+                "query": query,
+                "filename": name,
+                "error": f"Too large: {file_size / 1024 / 1024:.1f}MB",
+            })
+            continue
+
+        try:
+            with open(source_path, "rb") as f:
+                content = base64.b64encode(f.read()).decode("utf-8")
+
+            results.append({
+                "query": query,
+                "success": True,
+                "filename": name,
+                "size_bytes": file_size,
+                "content_base64": content,
+            })
+        except Exception as e:
+            results.append({
+                "query": query,
+                "error": str(e),
+            })
+
+    return json.dumps(results)
+
+
+@mcp.tool(
+    name="zotero_list_pdfs",
+    description="Search for PDFs and list their metadata without downloading content. Use this first to find files, then use zotero_get_pdf_base64 to download specific ones."
+)
+async def list_pdfs(
+    query: str,
+    limit: int = 10,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    List PDFs matching a query with metadata.
+
+    Args:
+        query: Search query
+        limit: Max results
+        ctx: MCP context
+
+    Returns:
+        JSON list of files with metadata
+    """
+    ctx.info(f"Listing PDFs for: {query}")
+
+    results = await _everything_search(query, count=limit, ext="pdf")
+
+    if not results:
+        return json.dumps({"error": f"No PDFs found matching: '{query}'"})
+
+    files = []
+    for result in results:
+        name = result.get("name", "")
+        path = result.get("path", "")
+
+        if not name or not path:
+            continue
+
+        source_path = Path(path) / name
+        size_bytes = 0
+
+        try:
+            if source_path.exists():
+                size_bytes = source_path.stat().st_size
+        except:
+            pass
+
+        files.append({
+            "filename": name,
+            "path": str(source_path),
+            "size_bytes": size_bytes,
+            "size_mb": round(size_bytes / 1024 / 1024, 2),
+        })
+
+    return json.dumps({
+        "query": query,
+        "count": len(files),
+        "files": files,
+    })
 
 
 def create_server() -> FastMCP:
