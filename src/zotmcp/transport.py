@@ -5,6 +5,7 @@ HTTP/SSE Transport for remote access to Zotero MCP.
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, Optional
 
 from aiohttp import web
@@ -30,6 +31,8 @@ class HTTPTransport:
         self.app.router.add_get("/tools", self._list_tools)
         self.app.router.add_post("/tools/{tool_name}", self._call_tool)
         self.app.router.add_get("/sse", self._sse_handler)
+        self.app.router.add_post("/sse", self._sse_handler)  # OpenCode uses POST
+        self.app.router.add_post("/messages", self._messages_handler)  # MCP SSE protocol
         self.app.router.add_options("/{path:.*}", self._cors_preflight)
 
         # Add CORS middleware
@@ -66,7 +69,6 @@ class HTTPTransport:
             token = auth_header[7:]
             return token == self.config.server.api_token
 
-
     def _get_timeout(self, request: web.Request) -> Optional[float]:
         """Get timeout from request header."""
         timeout_header = request.headers.get("X-Timeout")
@@ -85,11 +87,13 @@ class HTTPTransport:
         client = create_client(self.config.zotero)
         available = await client.is_available()
 
-        return web.json_response({
-            "status": "healthy" if available else "degraded",
-            "zotero_available": available,
-            "mode": self.config.zotero.mode,
-        })
+        return web.json_response(
+            {
+                "status": "healthy" if available else "degraded",
+                "zotero_available": available,
+                "mode": self.config.zotero.mode,
+            }
+        )
 
     async def _list_tools(self, request: web.Request) -> web.Response:
         """List available tools."""
@@ -101,10 +105,12 @@ class HTTPTransport:
         tool_manager = getattr(mcp, "_tool_manager", None)
         if tool_manager:
             for name, tool in tool_manager._tools.items():
-                tools.append({
-                    "name": name,
-                    "description": getattr(tool, "description", ""),
-                })
+                tools.append(
+                    {
+                        "name": name,
+                        "description": getattr(tool, "description", ""),
+                    }
+                )
 
         return web.json_response({"tools": tools})
 
@@ -132,17 +138,24 @@ class HTTPTransport:
         try:
             # Create a mock context for the tool
             class MockContext:
-                def info(self, msg): logger.info(msg)
-                def warn(self, msg): logger.warning(msg)
-                def error(self, msg): logger.error(msg)
+                def info(self, msg):
+                    logger.info(msg)
+
+                def warn(self, msg):
+                    logger.warning(msg)
+
+                def error(self, msg):
+                    logger.error(msg)
 
             # Call the tool function
             result = await tool.fn(**body, ctx=MockContext())
 
-            return web.json_response({
-                "tool": tool_name,
-                "result": result,
-            })
+            return web.json_response(
+                {
+                    "tool": tool_name,
+                    "result": result,
+                }
+            )
 
         except Exception as e:
             logger.exception(f"Error calling tool {tool_name}")
@@ -151,10 +164,114 @@ class HTTPTransport:
                 status=500,
             )
 
+    async def _messages_handler(self, request: web.Request) -> web.Response:
+        """Handle MCP protocol messages (POST /messages)."""
+        if not self._check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        # Handle MCP JSON-RPC messages
+        method = body.get("method", "")
+        params = body.get("params", {})
+        msg_id = body.get("id")
+
+        try:
+            if method == "initialize":
+                # MCP initialize handshake
+                result = {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {
+                        "name": "zotero-mcp-unified",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                    },
+                }
+            elif method == "tools/list":
+                # List available tools
+                tools = []
+                tool_manager = getattr(mcp, "_tool_manager", None)
+                if tool_manager:
+                    for name, tool in tool_manager._tools.items():
+                        tools.append(
+                            {
+                                "name": name,
+                                "description": getattr(tool, "description", ""),
+                                "inputSchema": getattr(
+                                    tool, "parameters", {"type": "object", "properties": {}}
+                                ),
+                            }
+                        )
+                result = {"tools": tools}
+            elif method == "tools/call":
+                # Call a tool
+                tool_name = params.get("name")
+                arguments = params.get("arguments", {})
+
+                tool_manager = getattr(mcp, "_tool_manager", None)
+                tool = tool_manager._tools.get(tool_name) if tool_manager else None
+                if not tool:
+                    return web.json_response(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "error": {"code": -32601, "message": f"Tool not found: {tool_name}"},
+                        }
+                    )
+
+                class MockContext:
+                    def info(self, msg):
+                        logger.info(msg)
+
+                    def warn(self, msg):
+                        logger.warning(msg)
+
+                    def error(self, msg):
+                        logger.error(msg)
+
+                tool_result = await tool.fn(**arguments, ctx=MockContext())
+                result = {
+                    "content": [{"type": "text", "text": str(tool_result)}],
+                    "isError": False,
+                }
+            elif method == "ping":
+                result = {}
+            else:
+                return web.json_response(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {"code": -32601, "message": f"Method not found: {method}"},
+                    }
+                )
+
+            # Return JSON-RPC response
+            return web.json_response(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": result,
+                }
+            )
+
+        except Exception as e:
+            logger.exception(f"Error handling MCP message: {method}")
+            return web.json_response(
+                {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": str(e)}}
+            )
+
     async def _sse_handler(self, request: web.Request) -> web.StreamResponse:
         """Server-Sent Events handler for MCP protocol."""
         if not self._check_auth(request):
             return web.json_response({"error": "Unauthorized"}, status=401)
+
+        # Generate session ID for this connection
+        session_id = str(uuid.uuid4())
 
         response = web.StreamResponse(
             status=200,
@@ -171,16 +288,19 @@ class HTTPTransport:
         self._sse_clients.append(response)
 
         try:
-            # Send initial connection event
-            await self._send_sse_event(response, "connected", {
-                "server": "zotero-mcp-unified",
-                "version": "0.1.0",
-            })
+            # Send MCP SSE protocol endpoint event (required by OpenCode)
+            await self._send_sse_event(
+                response,
+                "endpoint",
+                f"/messages?sessionId={session_id}",
+            )
 
             # Keep connection alive
             while True:
                 await asyncio.sleep(30)
-                await self._send_sse_event(response, "ping", {"timestamp": asyncio.get_event_loop().time()})
+                await self._send_sse_event(
+                    response, "ping", {"timestamp": asyncio.get_event_loop().time()}
+                )
 
         except asyncio.CancelledError:
             pass
@@ -227,9 +347,7 @@ class HTTPTransport:
         )
         await site.start()
 
-        logger.info(
-            f"HTTP server started on {self.config.server.host}:{self.config.server.port}"
-        )
+        logger.info(f"HTTP server started on {self.config.server.host}:{self.config.server.port}")
 
         return runner
 
