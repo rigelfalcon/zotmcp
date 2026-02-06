@@ -124,6 +124,67 @@ Check connection and library status.
 
 No parameters. Returns server status, mode, and library statistics.
 
+## PDF File Management (Everything Integration)
+
+### zotero_find_pdf
+Search for PDF files on local disk using Everything.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| query | string | yes | - | Search query (author, title, year) |
+| limit | int | no | 10 | Max results |
+
+**Prerequisites:** Everything HTTP server enabled on localhost:9090
+
+### zotero_list_pdfs
+List PDF metadata without downloading content.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| query | string | yes | - | Search query |
+| limit | int | no | 10 | Max results |
+
+Returns JSON with filename, path, and size. Use this before downloading.
+
+### zotero_copy_pdf
+Copy single PDF to target directory (local only).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| query | string | yes | - | Search query |
+| target_dir | string | yes | - | Target directory path |
+| new_filename | string | no | - | New filename (without .pdf) |
+| limit | int | no | 1 | Number of files to copy |
+
+### zotero_batch_copy_pdfs
+Batch copy multiple PDFs (local only).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| queries | list[string] | yes | - | List of search queries |
+| target_dir | string | yes | - | Target directory path |
+| filenames | list[string] | no | - | New filenames (parallel to queries) |
+
+### zotero_get_pdf_base64
+Download single PDF as base64 (remote capable).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| query | string | yes | - | Search query |
+
+Returns JSON with base64-encoded PDF content. Max file size: 50MB.
+
+**Remote Usage:** Decode base64 on client side to save PDF.
+
+### zotero_batch_get_pdfs_base64
+Batch download multiple PDFs as base64 (remote capable).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| queries | list[string] | yes | - | List of search queries |
+
+Returns JSON array with results for each query. Max 50MB per file.
+
 ## Configuration Reference
 
 ### Environment Variables
