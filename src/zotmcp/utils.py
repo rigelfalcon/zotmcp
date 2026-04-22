@@ -8,6 +8,29 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def strip_html(html: str) -> str:
+    """Strip HTML tags and decode common entities.
+
+    Args:
+        html: HTML string (e.g. from Zotero note content).
+
+    Returns:
+        Plain text with tags removed.
+    """
+    if not html:
+        return ""
+    # Remove tags
+    text = re.sub(r"<[^>]+>", "", html)
+    # Decode common entities
+    text = text.replace("&amp;", "&")
+    text = text.replace("&lt;", "<")
+    text = text.replace("&gt;", ">")
+    text = text.replace("&quot;", '"')
+    text = text.replace("&#39;", "'")
+    text = text.replace("&nbsp;", " ")
+    return text.strip()
+
+
 def get_zotero_base_attachment_path() -> Optional[str]:
     """Auto-detect Zotero's linked attachment base directory from prefs.js."""
     # Common Zotero profile locations
@@ -17,10 +40,10 @@ def get_zotero_base_attachment_path() -> Optional[str]:
         profile_base = os.path.expanduser('~/Library/Application Support/Zotero/Profiles')
         if not os.path.exists(profile_base):
             profile_base = os.path.expanduser('~/.zotero/zotero')
-    
+
     if not os.path.exists(profile_base):
         return None
-    
+
     # Find prefs.js in profile directory
     for root, dirs, files in os.walk(profile_base):
         if 'prefs.js' in files:
@@ -40,5 +63,5 @@ def get_zotero_base_attachment_path() -> Optional[str]:
                                 return path
             except Exception as e:
                 logger.warning(f"Failed to read prefs.js: {e}")
-    
+
     return None

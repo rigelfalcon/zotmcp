@@ -5,6 +5,7 @@ MCP Server implementation with all Zotero tools.
 import base64
 import json
 import logging
+import os
 import shutil
 import sys
 from contextlib import asynccontextmanager
@@ -1353,6 +1354,1017 @@ async def list_pdfs(
         "count": len(files),
         "files": files,
     })
+
+
+# =============================================================================
+# Collection Management Tools
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_get_item_children",
+    description="Get children (attachments, notes) of a Zotero item."
+)
+async def get_item_children(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Get children (attachments, notes) of an item.
+
+    Args:
+        item_key: Item key to get children for
+        ctx: MCP context
+
+    Returns:
+        JSON list of children items
+    """
+    ctx.info(f"Getting children for item {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    children = await client.get_item_children(item_key)
+
+    if not children:
+        return f"No children found for item `{item_key}`"
+
+    output = []
+    for child in children:
+        output.append({
+            "key": child.key,
+            "type": child.item_type,
+            "title": child.title,
+        })
+
+    return json.dumps(output, indent=2)
+
+
+@mcp.tool(
+    name="zotero_create_collection",
+    description="Create a new collection in Zotero. Note: Requires Web API mode (local API does not support this)."
+)
+async def create_collection(
+    name: str,
+    parent_key: Optional[str] = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Create a new collection.
+
+    Args:
+        name: Collection name
+        parent_key: Optional parent collection key (for subcollections)
+        ctx: MCP context
+
+    Returns:
+        Success message with collection key, or error message
+    """
+    ctx.info(f"Creating collection: {name}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    collection_key = await client.create_collection(name, parent_key)
+
+    if collection_key:
+        return f"Successfully created collection `{name}` with key `{collection_key}`"
+    else:
+        return (
+            "Error: Failed to create collection. "
+            "Note: Zotero Local API does not support creating collections. "
+            "Please use Web API mode or create collections manually in Zotero."
+        )
+
+
+@mcp.tool(
+    name="zotero_delete_collection",
+    description="Delete a collection from Zotero. Note: Requires Web API mode."
+)
+async def delete_collection(
+    collection_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Delete a collection.
+
+    Args:
+        collection_key: Collection key to delete
+        ctx: MCP context
+
+    Returns:
+        Success or error message
+    """
+    ctx.info(f"Deleting collection {collection_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    success = await client.delete_collection(collection_key)
+
+    if success:
+        return f"Successfully deleted collection `{collection_key}`"
+    else:
+        return (
+            "Error: Failed to delete collection. "
+            "Note: Zotero Local API does not support deleting collections. "
+            "Please use Web API mode or delete collections manually in Zotero."
+        )
+
+
+@mcp.tool(
+    name="zotero_rename_collection",
+    description="Rename a collection in Zotero. Note: Requires Web API mode."
+)
+async def rename_collection(
+    collection_key: str,
+    new_name: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Rename a collection.
+
+    Args:
+        collection_key: Collection key to rename
+        new_name: New collection name
+        ctx: MCP context
+
+    Returns:
+        Success or error message
+    """
+    ctx.info(f"Renaming collection {collection_key} to {new_name}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    success = await client.rename_collection(collection_key, new_name)
+
+    if success:
+        return f"Successfully renamed collection `{collection_key}` to `{new_name}`"
+    else:
+        return (
+            "Error: Failed to rename collection. "
+            "Note: Zotero Local API does not support renaming collections. "
+            "Please use Web API mode or rename collections manually in Zotero."
+        )
+
+
+@mcp.tool(
+    name="zotero_batch_move_to_collection",
+    description="Move multiple items to a collection at once."
+)
+async def batch_move_to_collection(
+    item_keys: list[str],
+    collection_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Move multiple items to a collection.
+
+    Args:
+        item_keys: List of item keys to move
+        collection_key: Target collection key
+        ctx: MCP context
+
+    Returns:
+        JSON summary of results
+    """
+    ctx.info(f"Batch moving {len(item_keys)} items to collection {collection_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    results = await client.batch_move_to_collection(item_keys, collection_key)
+
+    success_count = sum(1 for v in results.values() if v)
+    fail_count = len(results) - success_count
+
+    return json.dumps({
+        "total": len(item_keys),
+        "success": success_count,
+        "failed": fail_count,
+        "results": results,
+    }, indent=2)
+
+
+# =============================================================================
+# Notes Tools (Group 1)
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_get_notes",
+    description="Get notes from Zotero library, optionally filtered by parent item.",
+)
+async def get_notes(
+    item_key: Optional[str] = None,
+    limit: int = 50,
+    truncate: int = 500,
+    raw_html: bool = False,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Get notes from Zotero.
+
+    Args:
+        item_key: Parent item key to filter notes. If None, returns recent notes.
+        limit: Maximum number of notes to return.
+        truncate: Truncate note content to this many characters (0 = no truncation).
+        raw_html: If True, return raw HTML; otherwise strip to plain text.
+        ctx: MCP context.
+    """
+    ctx.info(f"Getting notes (item_key={item_key}, limit={limit})")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    from zotmcp.utils import strip_html
+
+    notes = await client.get_notes(item_key=item_key, limit=limit)
+    if not notes:
+        return "No notes found."
+
+    results = []
+    for note in notes:
+        raw_data = note.raw_data or {}
+        content = raw_data.get("data", {}).get("note", "")
+        if not raw_html:
+            content = strip_html(content)
+        if truncate > 0 and len(content) > truncate:
+            content = content[:truncate] + "..."
+
+        parent_key = raw_data.get("data", {}).get("parentItem", "")
+        results.append({
+            "key": note.key,
+            "parentItem": parent_key,
+            "tags": note.tags,
+            "dateModified": note.date_modified,
+            "content": content,
+        })
+
+    return json.dumps(results, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="zotero_search_notes",
+    description="Search note content by keyword.",
+)
+async def search_notes(
+    query: str,
+    limit: int = 20,
+    raw_html: bool = False,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Search notes by keyword in content.
+
+    Args:
+        query: Search query.
+        limit: Maximum results.
+        raw_html: Return raw HTML if True.
+        ctx: MCP context.
+    """
+    ctx.info(f"Searching notes for: {query}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    from zotmcp.utils import strip_html
+
+    # Get a batch of notes and filter client-side
+    notes = await client.get_notes(limit=200)
+    query_lower = query.lower()
+    matches = []
+
+    for note in notes:
+        raw_data = note.raw_data or {}
+        content = raw_data.get("data", {}).get("note", "")
+        plain = strip_html(content)
+        if query_lower in plain.lower():
+            if not raw_html:
+                content = plain
+            if len(content) > 500:
+                content = content[:500] + "..."
+            matches.append({
+                "key": note.key,
+                "parentItem": raw_data.get("data", {}).get("parentItem", ""),
+                "tags": note.tags,
+                "content": content,
+            })
+            if len(matches) >= limit:
+                break
+
+    if not matches:
+        return f"No notes found matching '{query}'."
+    return json.dumps(matches, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="zotero_update_note",
+    description="Update an existing note's content (append or replace).",
+)
+async def update_note(
+    item_key: str,
+    note_text: str,
+    append: bool = True,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Update note content.
+
+    Args:
+        item_key: Note item key.
+        note_text: New text content.
+        append: If True, append to existing content; if False, replace.
+        ctx: MCP context.
+    """
+    ctx.info(f"Updating note {item_key} (append={append})")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    success = await client.update_note(item_key, note_text, append=append)
+    if success:
+        action = "appended to" if append else "replaced"
+        return f"Successfully {action} note `{item_key}`."
+    return f"Failed to update note `{item_key}`. Check that the key is a note item."
+
+
+@mcp.tool(
+    name="zotero_delete_note",
+    description="Move a note to the Zotero trash.",
+)
+async def delete_note(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Delete (trash) a note.
+
+    Args:
+        item_key: Note item key.
+        ctx: MCP context.
+    """
+    ctx.info(f"Trashing note: {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    success = await client.trash_item(item_key)
+    if success:
+        return f"Note `{item_key}` moved to trash."
+    return f"Failed to trash note `{item_key}`."
+
+
+# =============================================================================
+# Annotations Tools (Group 2)
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_get_annotations",
+    description="Get PDF annotations (highlights, notes) for an item or all items.",
+)
+async def get_annotations(
+    item_key: Optional[str] = None,
+    limit: int = 50,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Get annotations from PDF attachments.
+
+    Args:
+        item_key: Parent item or attachment key. If None, returns recent annotations.
+        limit: Maximum number of annotations.
+        ctx: MCP context.
+    """
+    ctx.info(f"Getting annotations (item_key={item_key})")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    if item_key:
+        children = await client.get_item_children(item_key)
+    else:
+        children_raw = await client.get_all_items(limit=limit, item_type="annotation")
+        children = children_raw
+
+    annotations = []
+    for child in children:
+        raw = child.raw_data or {}
+        data = raw.get("data", {})
+        if data.get("itemType") == "annotation" or child.item_type == "annotation":
+            annotations.append({
+                "key": child.key,
+                "type": data.get("annotationType", "unknown"),
+                "text": data.get("annotationText", ""),
+                "comment": data.get("annotationComment", ""),
+                "color": data.get("annotationColor", ""),
+                "pageLabel": data.get("annotationPageLabel", ""),
+                "parentItem": data.get("parentItem", ""),
+                "tags": child.tags,
+            })
+            if len(annotations) >= limit:
+                break
+
+    if not annotations:
+        return "No annotations found."
+    return json.dumps(annotations, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="zotero_create_annotation",
+    description="Create a text highlight annotation on a PDF attachment.",
+)
+async def create_annotation(
+    attachment_key: str,
+    page: int,
+    text: str,
+    comment: Optional[str] = None,
+    color: str = "#ffd400",
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Create a highlight annotation.
+
+    Args:
+        attachment_key: PDF attachment key.
+        page: 0-based page number.
+        text: Text to highlight.
+        comment: Optional comment on the highlight.
+        color: Highlight color (hex). Default yellow.
+        ctx: MCP context.
+    """
+    ctx.info(f"Creating highlight annotation on {attachment_key} page {page}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Download PDF to find text position
+    pdf_bytes = await client.download_attachment(attachment_key)
+    if not pdf_bytes:
+        return f"Failed to download PDF for attachment `{attachment_key}`."
+
+    try:
+        from zotmcp.pdf_utils import find_text_position
+    except ImportError:
+        return "Error: PyMuPDF not installed. Install with: pip install 'zotmcp[pdf]'"
+
+    position = find_text_position(pdf_bytes, page, text)
+    if not position:
+        return f"Text not found on page {page} of attachment `{attachment_key}`."
+
+    annotation_data = {
+        "itemType": "annotation",
+        "parentItem": attachment_key,
+        "annotationType": "highlight",
+        "annotationText": text,
+        "annotationComment": comment or "",
+        "annotationColor": color,
+        "annotationPageLabel": str(page + 1),
+        "annotationPosition": json.dumps(position),
+        "tags": [],
+    }
+
+    key = await client.create_item_raw(annotation_data)
+    if key:
+        return f"Created highlight annotation `{key}` on page {page + 1}."
+    return "Failed to create annotation."
+
+
+@mcp.tool(
+    name="zotero_create_area_annotation",
+    description="Create an area (image/region) annotation on a PDF attachment.",
+)
+async def create_area_annotation(
+    attachment_key: str,
+    page: int,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    comment: Optional[str] = None,
+    color: str = "#ffd400",
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Create an area annotation on a PDF page.
+
+    Args:
+        attachment_key: PDF attachment key.
+        page: 0-based page number.
+        x: Left edge in PDF points from top-left.
+        y: Top edge in PDF points from top-left.
+        w: Width in PDF points.
+        h: Height in PDF points.
+        comment: Optional comment.
+        color: Annotation color (hex).
+        ctx: MCP context.
+    """
+    ctx.info(f"Creating area annotation on {attachment_key} page {page}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    pdf_bytes = await client.download_attachment(attachment_key)
+    if not pdf_bytes:
+        return f"Failed to download PDF for attachment `{attachment_key}`."
+
+    try:
+        from zotmcp.pdf_utils import build_area_position
+    except ImportError:
+        return "Error: PyMuPDF not installed. Install with: pip install 'zotmcp[pdf]'"
+
+    position = build_area_position(page, x, y, w, h, pdf_bytes)
+    if not position:
+        return f"Invalid page {page} or coordinates for attachment `{attachment_key}`."
+
+    annotation_data = {
+        "itemType": "annotation",
+        "parentItem": attachment_key,
+        "annotationType": "image",
+        "annotationComment": comment or "",
+        "annotationColor": color,
+        "annotationPageLabel": str(page + 1),
+        "annotationPosition": json.dumps(position),
+        "tags": [],
+    }
+
+    key = await client.create_item_raw(annotation_data)
+    if key:
+        return f"Created area annotation `{key}` on page {page + 1}."
+    return "Failed to create annotation."
+
+
+# =============================================================================
+# DOI/URL Import Tools (Group 3)
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_add_by_doi",
+    description="Add item to Zotero by DOI. Fetches metadata from CrossRef.",
+)
+async def add_by_doi(
+    doi: str,
+    collections: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Import an item by DOI.
+
+    Args:
+        doi: DOI string (e.g. '10.1234/example').
+        collections: Collection keys to add item to.
+        tags: Tags to apply.
+        ctx: MCP context.
+    """
+    ctx.info(f"Adding item by DOI: {doi}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    from zotmcp.crossref import fetch_crossref_metadata
+
+    item_data = await fetch_crossref_metadata(doi)
+    if not item_data:
+        return f"Failed to fetch metadata for DOI `{doi}`. Check the DOI is valid."
+
+    if collections:
+        item_data["collections"] = collections
+    if tags:
+        item_data["tags"] = [{"tag": t} for t in tags]
+
+    key = await client.create_item_raw(item_data)
+    if key:
+        title = item_data.get("title", "Unknown")
+        return f"Created item `{key}`: {title}\nDOI: {doi}"
+    return f"Failed to create item for DOI `{doi}`."
+
+
+@mcp.tool(
+    name="zotero_add_by_url",
+    description="Add a web page item to Zotero by URL.",
+)
+async def add_by_url(
+    url: str,
+    collections: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Add a web page reference.
+
+    Args:
+        url: Web page URL.
+        collections: Collection keys.
+        tags: Tags to apply.
+        ctx: MCP context.
+    """
+    ctx.info(f"Adding web page: {url}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    item_data = {
+        "itemType": "webpage",
+        "title": url,
+        "url": url,
+        "accessDate": "",
+        "creators": [],
+        "tags": [{"tag": t} for t in (tags or [])],
+        "collections": collections or [],
+    }
+
+    # Try to fetch title from URL
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as http:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            # Extract title from HTML
+            import re
+            title_match = re.search(r"<title[^>]*>([^<]+)</title>", resp.text, re.IGNORECASE)
+            if title_match:
+                item_data["title"] = title_match.group(1).strip()
+    except Exception:
+        pass  # Keep URL as title
+
+    key = await client.create_item_raw(item_data)
+    if key:
+        return f"Created web page item `{key}`: {item_data['title']}"
+    return f"Failed to create item for URL `{url}`."
+
+
+@mcp.tool(
+    name="zotero_add_from_file",
+    description="Add an item to Zotero from a local file (PDF). Extracts DOI if possible.",
+)
+async def add_from_file(
+    file_path: str,
+    title: Optional[str] = None,
+    item_type: str = "journalArticle",
+    collections: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Create a Zotero item from a local file.
+
+    Args:
+        file_path: Absolute path to the file (typically PDF).
+        title: Item title. If None, uses filename.
+        item_type: Zotero item type. Default 'journalArticle'.
+        collections: Collection keys.
+        tags: Tags to apply.
+        ctx: MCP context.
+    """
+    ctx.info(f"Adding item from file: {file_path}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    if not os.path.isfile(file_path):
+        return f"File not found: {file_path}"
+
+    # Try to extract DOI from PDF
+    extracted_doi = None
+    if file_path.lower().endswith(".pdf"):
+        try:
+            from zotmcp.pdf_utils import extract_doi_from_pdf
+            with open(file_path, "rb") as f:
+                pdf_bytes = f.read()
+            extracted_doi = extract_doi_from_pdf(pdf_bytes)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"DOI extraction failed: {e}")
+
+    # If DOI found, use CrossRef metadata
+    if extracted_doi:
+        from zotmcp.crossref import fetch_crossref_metadata
+        item_data = await fetch_crossref_metadata(extracted_doi)
+        if item_data:
+            ctx.info(f"Found DOI {extracted_doi}, using CrossRef metadata")
+        else:
+            item_data = None
+    else:
+        item_data = None
+
+    # Fallback: create minimal item
+    if not item_data:
+        item_data = {
+            "itemType": item_type,
+            "title": title or Path(file_path).stem,
+            "creators": [],
+            "tags": [],
+        }
+
+    if collections:
+        item_data["collections"] = collections
+    if tags:
+        item_data["tags"] = [{"tag": t} for t in tags]
+
+    key = await client.create_item_raw(item_data)
+    if key:
+        result = f"Created item `{key}`: {item_data.get('title', 'Untitled')}"
+        if extracted_doi:
+            result += f"\nDOI: {extracted_doi}"
+        result += f"\nNote: File attachment must be added manually in Zotero or via drag-drop."
+        return result
+    return "Failed to create item."
+
+
+# =============================================================================
+# Duplicate Management Tools (Group 4)
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_find_duplicates",
+    description="Find potential duplicate items in the library.",
+)
+async def find_duplicates(
+    method: str = "title",
+    collection_key: Optional[str] = None,
+    limit: int = 50,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Find duplicate items.
+
+    Args:
+        method: Matching method: 'title' (normalized title), 'doi' (exact DOI), 'both'.
+        collection_key: Limit search to a collection.
+        limit: Maximum items to scan.
+        ctx: MCP context.
+    """
+    ctx.info(f"Finding duplicates (method={method}, limit={limit})")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Get items
+    if collection_key:
+        items = await client.get_collection_items(collection_key, limit=limit)
+    else:
+        items = await client.get_all_items(limit=limit)
+
+    if not items:
+        return "No items found to check."
+
+    # Group by key
+    from collections import defaultdict
+    title_groups = defaultdict(list)
+    doi_groups = defaultdict(list)
+
+    for item in items:
+        if method in ("title", "both"):
+            # Normalize title: lowercase, strip punctuation, collapse whitespace
+            import re
+            norm_title = re.sub(r"[^\w\s]", "", item.title.lower()).strip()
+            norm_title = re.sub(r"\s+", " ", norm_title)
+            if norm_title:
+                title_groups[norm_title].append(item)
+
+        if method in ("doi", "both") and item.doi:
+            doi_groups[item.doi.lower().strip()].append(item)
+
+    # Collect duplicate groups
+    dup_groups = []
+
+    for key, group in title_groups.items():
+        if len(group) >= 2:
+            dup_groups.append({
+                "matchType": "title",
+                "matchValue": key,
+                "items": [
+                    {"key": i.key, "title": i.title, "date": i.date, "creators": i.format_creators()}
+                    for i in group
+                ],
+            })
+
+    for key, group in doi_groups.items():
+        if len(group) >= 2:
+            dup_groups.append({
+                "matchType": "doi",
+                "matchValue": key,
+                "items": [
+                    {"key": i.key, "title": i.title, "date": i.date, "doi": i.doi}
+                    for i in group
+                ],
+            })
+
+    if not dup_groups:
+        return f"No duplicates found among {len(items)} items."
+    return json.dumps({
+        "totalScanned": len(items),
+        "duplicateGroups": len(dup_groups),
+        "groups": dup_groups,
+    }, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="zotero_merge_duplicates",
+    description="Merge duplicate items by keeping one and trashing others. Dry-run by default.",
+)
+async def merge_duplicates(
+    keeper_key: str,
+    duplicate_keys: list[str],
+    confirm: bool = False,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Merge duplicate items.
+
+    Args:
+        keeper_key: Key of the item to keep.
+        duplicate_keys: Keys of duplicate items to trash.
+        confirm: Must be True to actually perform the merge. False = dry-run preview.
+        ctx: MCP context.
+    """
+    ctx.info(f"Merge duplicates: keep {keeper_key}, trash {len(duplicate_keys)} items (confirm={confirm})")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Fetch details for preview
+    keeper = await client.get_item(keeper_key)
+    if not keeper:
+        return f"Keeper item `{keeper_key}` not found."
+
+    dupes = []
+    for dk in duplicate_keys:
+        item = await client.get_item(dk)
+        if item:
+            dupes.append(item)
+
+    preview = {
+        "action": "merge_duplicates",
+        "keeper": {"key": keeper.key, "title": keeper.title, "creators": keeper.format_creators()},
+        "toTrash": [{"key": d.key, "title": d.title} for d in dupes],
+        "confirm": confirm,
+    }
+
+    if not confirm:
+        preview["message"] = "DRY RUN: Set confirm=True to execute. This will trash the duplicate items."
+        return json.dumps(preview, indent=2, ensure_ascii=False)
+
+    # Actually trash duplicates
+    trashed = []
+    failed = []
+    for dupe in dupes:
+        success = await client.trash_item(dupe.key)
+        if success:
+            trashed.append(dupe.key)
+        else:
+            failed.append(dupe.key)
+
+    preview["result"] = {"trashed": trashed, "failed": failed}
+    preview["message"] = f"Merged: trashed {len(trashed)} items, {len(failed)} failed."
+    return json.dumps(preview, indent=2, ensure_ascii=False)
+
+
+# =============================================================================
+# PDF Outline + Citation Key Tools (Group 5)
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_get_pdf_outline",
+    description="Get the table of contents (outline/bookmarks) of a PDF attachment.",
+)
+async def get_pdf_outline(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Extract PDF outline.
+
+    Args:
+        item_key: Attachment key for a PDF item.
+        ctx: MCP context.
+    """
+    ctx.info(f"Getting PDF outline for: {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    pdf_bytes = await client.download_attachment(item_key)
+    if not pdf_bytes:
+        return f"Failed to download PDF for `{item_key}`. Is it a PDF attachment?"
+
+    try:
+        from zotmcp.pdf_utils import extract_pdf_outline
+    except ImportError:
+        return "Error: PyMuPDF not installed. Install with: pip install 'zotmcp[pdf]'"
+
+    outline = extract_pdf_outline(pdf_bytes)
+    if not outline:
+        return f"No outline/bookmarks found in PDF `{item_key}`."
+
+    # Format as indented text
+    lines = []
+    for entry in outline:
+        indent = "  " * (entry["level"] - 1)
+        lines.append(f"{indent}{entry['title']} (p. {entry['page']})")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="zotero_search_by_citation_key",
+    description="Search for items by citation key (e.g. 'smith2020' from BetterBibTeX or Extra field).",
+)
+async def search_by_citation_key(
+    citekey: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Search by citation key.
+
+    Looks in the Extra field for 'Citation Key: ...' or 'bibtex: ...' patterns,
+    and also checks if the citekey appears as a tag.
+
+    Args:
+        citekey: Citation key to search for.
+        ctx: MCP context.
+    """
+    ctx.info(f"Searching for citation key: {citekey}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Search by the citekey as a query (will match in Extra and other fields)
+    items = await client.search_items(citekey, limit=20)
+
+    matches = []
+    citekey_lower = citekey.lower()
+    for item in items:
+        # Check Extra field for citation key patterns
+        extra = (item.extra or "").lower()
+        is_match = False
+
+        if f"citation key: {citekey_lower}" in extra:
+            is_match = True
+        elif f"bibtex: {citekey_lower}" in extra:
+            is_match = True
+        elif citekey_lower in [t.lower() for t in item.tags]:
+            is_match = True
+        elif citekey_lower in extra:
+            is_match = True
+
+        if is_match:
+            matches.append({
+                "key": item.key,
+                "title": item.title,
+                "creators": item.format_creators(),
+                "date": item.date,
+                "doi": item.doi,
+                "extra": item.extra[:200] if item.extra else "",
+            })
+
+    if not matches:
+        return f"No items found with citation key '{citekey}'."
+    return json.dumps(matches, indent=2, ensure_ascii=False)
 
 
 def create_server() -> FastMCP:

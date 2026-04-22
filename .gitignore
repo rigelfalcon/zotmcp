@@ -1,12 +1,15 @@
-# Byte-compiled / optimized / DLL files
+# ═══════════════════════════════════════════════
+# ZotMCP .gitignore
+# ═══════════════════════════════════════════════
+
+# ── Python ──
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
+*.pyd
 
-# Distribution / packaging
+# ── Distribution / packaging ──
 .Python
 build/
 develop-eggs/
@@ -24,15 +27,16 @@ wheels/
 .installed.cfg
 *.egg
 
-# PyInstaller
-*.manifest
-*.spec
+# ── Virtual environments ──
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
+# ── Testing ──
 htmlcov/
 .tox/
 .nox/
@@ -46,46 +50,60 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
-# Translations
+# ── Translations ──
 *.mo
 *.pot
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# IDE
+# ── IDE / Editor ──
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# OS
+# ── OS ──
 .DS_Store
 Thumbs.db
+Desktop.ini
+ehthumbs.db
 
-# Project specific
+# ── Node (mcp-remote / npx cache) ──
+node_modules/
+
+# ── Logs ──
 *.log
-.config/
-chroma_db/
 
-# Development and private folders (DO NOT PUBLISH)
-dev/
-backup/
-private/
-temp/
-*.bak
-
-# Sensitive files
+# ── Secrets / credentials (CRITICAL) ──
 *.env
 .env.*
+!.env.example
 config.json
+credential.yml
+credential.yaml
 secrets.*
 *_secret*
 *_private*
+
+# ── Private / development folders ──
+private/
+dev/
+backup/
+temp/
+*.bak
+
+# ── ChromaDB (semantic search data) ──
+chroma/
+chroma_db/
+
+# ── Spec workflow (MCP plugin cache) ──
+.spec-workflow/
+
+# ── Ad-hoc test scripts (not part of test suite) ──
+test_hybrid_*.py
+test_new_features.py
+
+# ── Installer / PyInstaller ──
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt

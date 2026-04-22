@@ -1,216 +1,105 @@
-# ZotMCP LAN Client Setup Guide
+# ZotMCP LAN Client Setup
 
-## Server Information
+Connect Claude Code (or any MCP client) to a running ZotMCP server on your LAN.
 
-**Server Host**: `192.168.8.31` (Ethernet) or `192.168.8.5` (WiFi)
-**Server Port**: `8765` (default)
-**Protocol**: HTTP with SSE (Server-Sent Events)
+## Prerequisites
 
----
+- ZotMCP server running (see README.md for server setup)
+- Node.js installed on the client machine
+- Claude Code installed
 
-## Quick Start
+## Step 1: Find the Server IP
 
-### 1. Download ZotMCP
+Ask the server admin, or on the server machine run:
+```cmd
+ipconfig | findstr "IPv4"
+```
+The server listens on port **8765** by default.
+
+## Step 2: Test Connectivity
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/zotmcp.git
-cd zotmcp
+# Replace <SERVER_IP> with actual IP
+ping <SERVER_IP>
+curl http://<SERVER_IP>:8765/health
+# Expected: {"status": "healthy", "zotero_available": true, ...}
 ```
 
-### 2. Install Dependencies
+## Step 3: Configure Claude Code
 
-**Option A: Using uv (recommended, faster)**
-```bash
-uv venv --python 3.11 .venv
-uv pip install --python .venv/Scripts/python.exe -e ".[semantic]"
-```
+Edit `~/.claude.json` (or `%USERPROFILE%\.claude.json` on Windows).
 
-**Option B: Using standard pip**
-```bash
-python -m venv .venv
-.venv\Scripts\pip.exe install -e ".[semantic]"
-```
-
-### 3. Configure Client
-
-Create or edit `~/.config/zotero-mcp-unified/config.json`:
+Add under `"mcpServers"`:
 
 ```json
-{
-  "zotero": {
-    "mode": "http",
-    "http_server": {
-      "host": "192.168.8.31",
-      "port": 8765,
-      "api_token": null
-    }
-  },
-  "semantic": {
-    "enabled": false
-  }
+"zotmcp": {
+  "command": "npx",
+  "args": [
+    "-y", "mcp-remote",
+    "http://<SERVER_IP>:8765/sse",
+    "--allow-http",
+    "--transport", "sse-only"
+  ]
 }
 ```
 
-**Note**: Semantic search runs on server side only, client doesn't need it.
+**Key flags:**
+- `--allow-http` — required because the server is HTTP (not HTTPS) on LAN
+- `--transport sse-only` — forces legacy SSE mode; without this, `mcp-remote`
+  tries Streamable HTTP first and may hang
 
-### 4. Test Connection
+## Step 4: Add Permissions
 
-```bash
-# Activate virtual environment
-.venv\Scripts\activate
-
-# Test server connectivity
-python -c "import requests; r = requests.get('http://192.168.8.31:8765/health'); print(r.json())"
-```
-
-Expected output:
-```json
-{"status": "ok", "zotero": "connected", "semantic": true}
-```
-
----
-
-## Claude Desktop/Code Integration
-
-### Add to MCP Settings
-
-**File**: `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
-**File**: `~/.config/Claude/claude_desktop_config.json` (Linux/Mac)
+Edit `~/.claude/settings.json`, add to `permissions.allow`:
 
 ```json
-{
-  "mcpServers": {
-    "zotero-lan": {
-      "command": "python",
-      "args": [
-        "-m",
-        "zotmcp.cli",
-        "serve",
-        "--transport",
-        "http",
-        "--host",
-        "192.168.8.31",
-        "--port",
-        "8765"
-      ],
-      "env": {
-        "ZOTERO_SEMANTIC_ENABLED": "false"
-      }
-    }
-  }
-}
+"mcp__zotmcp"
 ```
 
-**Important**: Use full path to Python if needed:
-```json
-"command": "C:\path\to\zotmcp\.venv\Scripts\python.exe"
-```
+## Step 5: Restart Claude Code
 
----
-
-## Usage Examples
-
-### From Command Line
-
-```bash
-# List available tools
-curl http://192.168.8.31:8765/tools
-
-# Search for papers
-curl -X POST http://192.168.8.31:8765/call_tool \
-  -H "Content-Type: application/json" \
-  -d "{\"name\": \"zotero_search\", \"arguments\": {\"query\": \"NARMAX\", \"limit\": 5}}"
-
-# Get item details
-curl -X POST http://192.168.8.31:8765/call_tool \
-  -H "Content-Type: application/json" \
-  -d "{\"name\": \"zotero_get_item\", \"arguments\": {\"item_key\": \"ABC123\", \"format\": \"markdown\"}}"
-```
-
-### From Claude
-
-Once configured, use natural language:
+MCP servers load at startup. Restart, then verify:
 
 ```
-"Search my Zotero library for papers about Volterra series"
-"Get the citation for item ABC123 in BibTeX format"
-"Show me recent papers in the GFRF collection"
+/mcp
 ```
 
----
+`zotmcp` should show **connected** with 25 tools.
+
+## Quick Test
+
+After connecting, try:
+```
+Search my Zotero for "neural networks"
+```
 
 ## Troubleshooting
 
-### Cannot Connect to Server
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `HTTP 405: Invalid OAuth error response` | Server missing 404 catch-all | Update server `transport.py` |
+| `Non-HTTPS URLs are only allowed for localhost` | Missing `--allow-http` | Add `--allow-http` to args |
+| Connecting... then timeout | Missing `--transport sse-only` | Add `--transport sse-only` to args |
+| `ModuleNotFoundError: No module named 'zotmcp'` | Server PYTHONPATH not set | Use `start-server.bat` to launch |
+| Wrong tools / different server | Public `zotero-mcp` on same port | Check process: `netstat -ano \| findstr 8765` |
+| Proxy interference | HTTP_PROXY routes LAN traffic | Bypass LAN IPs in proxy settings |
 
-1. **Check server is running**:
-   ```bash
-   curl http://192.168.8.31:8765/health
-   ```
+## Alternative Clients
 
-2. **Ping server**:
-   ```bash
-   ping 192.168.8.31
-   ```
+### OpenCode / Cursor / Other MCP Clients
 
-3. **Check firewall**: Windows Firewall may block port 8765
-   - Allow Python through firewall
-   - Or disable firewall temporarily for testing
+Use SSE transport directly if the client supports it:
+- SSE endpoint: `http://<SERVER_IP>:8765/sse`
+- Messages endpoint: `http://<SERVER_IP>:8765/messages`
 
-4. **Try alternate IP**: Use `192.168.8.5` if Ethernet IP doesn't work
+### Direct HTTP API
 
-### Server Shows "Zotero Not Available"
+```bash
+# List tools
+curl http://<SERVER_IP>:8765/tools
 
-- Ensure Zotero desktop is running on **server machine** (`192.168.8.31`)
-- Zotero Connector must be enabled (Tools → Preferences → Advanced)
-
-### Slow First Search
-
-- Server downloads embedding model (~90MB) on first semantic search
-- Subsequent searches are fast (model cached)
-
----
-
-## Security Notes
-
-- **No authentication** in current setup (LAN only)
-- **Do not expose** port 8765 to internet
-- For added security, enable `api_token` in server config
-
----
-
-## Advanced: Enable API Token
-
-### Server Config
-
-Edit server's `config.json`:
-```json
-{
-  "server": {
-    "api_token": "your-secret-token-here"
-  }
-}
+# Search
+curl -X POST http://<SERVER_IP>:8765/tools/zotero_search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "neural networks", "limit": 5}'
 ```
-
-### Client Config
-
-Update client's `config.json`:
-```json
-{
-  "zotero": {
-    "http_server": {
-      "host": "192.168.8.31",
-      "port": 8765,
-      "api_token": "your-secret-token-here"
-    }
-  }
-}
-```
-
----
-
-## Support
-
-- GitHub Repository: Check README.md for latest updates
-- Documentation: See `skills/zotero/` folder
-- Server IP may change on reboot - check with `ipconfig` on server

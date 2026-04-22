@@ -7,6 +7,14 @@ setlocal enabledelayedexpansion
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
+:: Load .env if exists
+if exist "%SCRIPT_DIR%.env" (
+    for /f "usebackq tokens=1,* delims==" %%a in ("%SCRIPT_DIR%.env") do (
+        if not "%%a"=="" if not "%%a:~0,1%"=="#" set "%%a=%%b"
+    )
+    call :log "Loaded .env"
+)
+
 set "LOG_FILE=%SCRIPT_DIR%autostart.log"
 set "MAX_WAIT_MINUTES=30"
 set "CHECK_INTERVAL_SECONDS=10"
@@ -44,6 +52,8 @@ if %errorlevel% neq 0 (
 )
 
 :: Check if Zotero API is responding
+set PYTHONPATH=src
+set ZOTMCP_CREDENTIALS=%SCRIPT_DIR%..\..\private\credential.yml
 .venv\Scripts\python.exe -c "import asyncio; from zotmcp.clients import create_client; from zotmcp.config import load_config; c = load_config(); client = create_client(c.zotero); exit(0 if asyncio.run(client.is_available()) else 1)" 2>nul
 if %errorlevel% neq 0 (
     call :log "  Zotero process found but API not ready, waiting %CHECK_INTERVAL_SECONDS%s..."
@@ -56,8 +66,9 @@ if %errorlevel% neq 0 (
 call :log "SUCCESS: Zotero is ready!"
 call :log "Starting ZotMCP HTTP server on 0.0.0.0:8765..."
 
-:: Start ZotMCP server
-start "ZotMCP HTTP Server" /MIN .venv\Scripts\python.exe -m zotmcp.cli serve --transport http --host 0.0.0.0 --port 8765
+:: Start ZotMCP server (PYTHONPATH=src required for module resolution)
+start "ZotMCP HTTP Server" /MIN cmd /c "cd /d %SCRIPT_DIR% && set PYTHONPATH=src
+set ZOTMCP_CREDENTIALS=%SCRIPT_DIR%..\..\private\credential.yml && .venv\Scripts\python.exe -m zotmcp.cli serve --transport http --host 0.0.0.0 --port 8765"
 
 :: Wait a bit and verify
 timeout /t 3 /nobreak >nul
@@ -66,8 +77,9 @@ tasklist /FI "WINDOWTITLE eq ZotMCP*" 2>nul | find /I "python.exe" >nul
 if %errorlevel%==0 (
     call :log "ZotMCP server started successfully"
     call :log "Server accessible at:"
-    call :log "  - http://192.168.8.31:8765"
-    call :log "  - http://192.168.8.5:8765"
+    for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /i "IPv4"') do (
+        call :log "  - http://%%a:8765"
+    )
 ) else (
     call :log "ERROR: Failed to start ZotMCP server"
     exit /b 1

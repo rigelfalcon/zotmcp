@@ -49,6 +49,10 @@ semantic = [
     "chromadb>=0.4.0",
     "sentence-transformers>=2.2.0",
 ]
+pdf = [
+    "PyMuPDF>=1.23.0",
+]
+
 [project.scripts]
 zotmcp = "zotmcp.cli:main"
 

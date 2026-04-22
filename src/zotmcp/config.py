@@ -2,10 +2,19 @@
 Configuration management for Zotero MCP Unified.
 """
 
+from __future__ import annotations
+
 import os
 import json
+import yaml
 from pathlib import Path
-from typing import Literal, Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv is optional
+from typing import Literal, Optional, List
 from pydantic import BaseModel, Field
 
 
@@ -13,9 +22,9 @@ class ZoteroConfig(BaseModel):
     """Zotero connection configuration."""
 
     # Connection mode
-    mode: Literal["local", "web", "sqlite"] = Field(
+    mode: Literal["local", "web", "sqlite", "hybrid"] = Field(
         default="local",
-        description="Connection mode: local (Zotero app), web (API), sqlite (direct DB)"
+        description="Connection mode: local (Zotero app), web (API), sqlite (direct DB), hybrid (local reads + web collection CRUD)"
     )
 
     # Local API settings (port 23119)
@@ -65,7 +74,7 @@ class ServerConfig(BaseModel):
     )
     host: str = Field(default="0.0.0.0", description="HTTP server host")
     port: int = Field(default=8765, description="HTTP server port")
-    cors_origins: list[str] = Field(default=["*"], description="CORS allowed origins")
+    cors_origins: List[str] = Field(default=["*"], description="CORS allowed origins")
 
     # Authentication
     api_token: Optional[str] = Field(default=None, description="API token for remote access")
@@ -106,6 +115,36 @@ def load_config(config_path: Optional[Path] = None) -> Config:
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
             config_data = json.load(f)
+
+    # Load credentials from credential file (env var > relative > ~/.config)
+    credential_path = None
+    if env_cred := os.environ.get("ZOTMCP_CREDENTIALS"):
+        credential_path = Path(env_cred)
+    else:
+        # Check relative paths from package root and common locations
+        for candidate in [
+            Path(__file__).resolve().parent.parent.parent / "private" / "credential.yml",  # repo/private/
+            Path(__file__).resolve().parent.parent.parent.parent.parent / "private" / "credential.yml",  # mng/private/
+            Path.home() / ".config" / "zotmcp" / "credential.yml",
+        ]:
+            if candidate.exists():
+                credential_path = candidate
+                break
+    if credential_path and credential_path.exists():
+        try:
+            with open(credential_path, "r", encoding="utf-8") as f:
+                credentials = yaml.safe_load(f)
+                if credentials and "zotero" in credentials:
+                    if "zotero" not in config_data:
+                        config_data["zotero"] = {}
+                    zotero_creds = credentials["zotero"]
+                    if "api_key" in zotero_creds:
+                        config_data["zotero"]["api_key"] = zotero_creds["api_key"]
+                    if "library_id" in zotero_creds:
+                        config_data["zotero"]["library_id"] = zotero_creds["library_id"]
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to load credentials from {credential_path}: {e}")
 
     # Override with environment variables
     env_mappings = {

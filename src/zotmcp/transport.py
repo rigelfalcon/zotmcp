@@ -23,7 +23,7 @@ class HTTPTransport:
         self.config = config or load_config()
         self.app = web.Application()
         self._setup_routes()
-        self._sse_clients: list[web.StreamResponse] = []
+        self._sse_clients: dict[str, web.StreamResponse] = {}
 
     def _setup_routes(self):
         """Setup HTTP routes."""
@@ -33,6 +33,15 @@ class HTTPTransport:
         self.app.router.add_get("/sse", self._sse_handler)
         self.app.router.add_post("/sse", self._sse_handler)  # OpenCode uses POST
         self.app.router.add_post("/messages", self._messages_handler)  # MCP SSE protocol
+        self.app.router.add_post("/mcp", self._messages_handler)  # MCP Streamable HTTP (Claude Code 2.1+)
+        self.app.router.add_get("/mcp", self._sse_handler)  # Streamable HTTP SSE fallback
+        # OAuth/OIDC discovery endpoints - return 404 to prevent 405 from catch-all
+        # Claude Code 2.1+ probes all of these before SSE connection
+        self.app.router.add_get("/.well-known/{path:.*}", self._not_found)
+        self.app.router.add_post("/register", self._not_found)
+        # Catch-all for any unregistered GET/POST paths (returns 404 instead of 405)
+        self.app.router.add_get("/{path:.*}", self._not_found)
+        self.app.router.add_post("/{path:.*}", self._not_found)
         self.app.router.add_options("/{path:.*}", self._cors_preflight)
 
         # Add CORS middleware
@@ -47,6 +56,14 @@ class HTTPTransport:
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return response
+
+    async def _not_found(self, request: web.Request) -> web.Response:
+        """Return 404 for unimplemented endpoints.
+
+        Claude Code bug #46640: OAuth probe triggers auth flow on any non-200.
+        We return plain 404 with no body to minimize false positives.
+        """
+        return web.Response(status=404, body=b"", content_type="text/plain")
 
     async def _cors_preflight(self, request: web.Request) -> web.Response:
         """Handle CORS preflight requests."""
@@ -179,6 +196,10 @@ class HTTPTransport:
         params = body.get("params", {})
         msg_id = body.get("id")
 
+
+        # MCP notifications (no id) - accept silently per spec
+        if method.startswith("notifications/"):
+            return web.Response(status=202)
         try:
             if method == "initialize":
                 # MCP initialize handshake
@@ -216,13 +237,16 @@ class HTTPTransport:
                 tool_manager = getattr(mcp, "_tool_manager", None)
                 tool = tool_manager._tools.get(tool_name) if tool_manager else None
                 if not tool:
-                    return web.json_response(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "error": {"code": -32601, "message": f"Tool not found: {tool_name}"},
-                        }
-                    )
+                    tnf_response = {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "error": {"code": -32601, "message": f"Tool not found: {tool_name}"},
+                    }
+                    sid = request.rel_url.query.get("sessionId")
+                    if sid and sid in self._sse_clients:
+                        await self._send_sse_event(self._sse_clients[sid], "message", tnf_response)
+                        return web.Response(status=202)
+                    return web.json_response(tnf_response)
 
                 class MockContext:
                     def info(self, msg):
@@ -242,28 +266,45 @@ class HTTPTransport:
             elif method == "ping":
                 result = {}
             else:
-                return web.json_response(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "error": {"code": -32601, "message": f"Method not found: {method}"},
-                    }
-                )
-
-            # Return JSON-RPC response
-            return web.json_response(
-                {
+                mnf_response = {
                     "jsonrpc": "2.0",
                     "id": msg_id,
-                    "result": result,
+                    "error": {"code": -32601, "message": f"Method not found: {method}"},
                 }
-            )
+                sid = request.rel_url.query.get("sessionId")
+                if sid and sid in self._sse_clients:
+                    await self._send_sse_event(self._sse_clients[sid], "message", mnf_response)
+                    return web.Response(status=202)
+                return web.json_response(mnf_response)
+
+            # Build JSON-RPC response
+            rpc_response = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": result,
+            }
+
+            # If request has sessionId, push via SSE stream (legacy SSE protocol)
+            sid = request.rel_url.query.get("sessionId")
+            if sid and sid in self._sse_clients:
+                await self._send_sse_event(
+                    self._sse_clients[sid],
+                    "message",
+                    rpc_response,
+                )
+                return web.Response(status=202)
+
+            # Otherwise return as HTTP response (Streamable HTTP)
+            return web.json_response(rpc_response)
 
         except Exception as e:
             logger.exception(f"Error handling MCP message: {method}")
-            return web.json_response(
-                {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": str(e)}}
-            )
+            err_response = {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": str(e)}}
+            sid = request.rel_url.query.get("sessionId")
+            if sid and sid in self._sse_clients:
+                await self._send_sse_event(self._sse_clients[sid], "message", err_response)
+                return web.Response(status=202)
+            return web.json_response(err_response)
 
     async def _sse_handler(self, request: web.Request) -> web.StreamResponse:
         """Server-Sent Events handler for MCP protocol."""
@@ -285,7 +326,7 @@ class HTTPTransport:
         )
         await response.prepare(request)
 
-        self._sse_clients.append(response)
+        self._sse_clients[session_id] = response
 
         try:
             # Send MCP SSE protocol endpoint event (required by OpenCode)
@@ -305,7 +346,7 @@ class HTTPTransport:
         except asyncio.CancelledError:
             pass
         finally:
-            self._sse_clients.remove(response)
+            self._sse_clients.pop(session_id, None)
 
         return response
 
@@ -327,7 +368,7 @@ class HTTPTransport:
 
     async def broadcast_event(self, event: str, data: Any):
         """Broadcast an event to all SSE clients."""
-        for client in self._sse_clients:
+        for client in self._sse_clients.values():
             try:
                 await self._send_sse_event(client, event, data)
             except Exception:

@@ -11,6 +11,14 @@ setlocal enabledelayedexpansion
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
+:: Load .env if exists
+if exist "%SCRIPT_DIR%.env" (
+    for /f "usebackq tokens=1,* delims==" %%a in ("%SCRIPT_DIR%.env") do (
+        if not "%%a"=="" if not "%%a:~0,1%"=="#" set "%%a=%%b"
+    )
+    echo [OK] Loaded .env
+)
+
 set "MODE=%~1"
 set "SEMANTIC=%~2"
 set "PORT=%~3"
@@ -67,6 +75,10 @@ if not exist ".venv\Scripts\python.exe" (
 ) else (
     echo [OK] Virtual environment found
 )
+
+:: Set PYTHONPATH for module resolution (editable install may not register package)
+set PYTHONPATH=src
+set ZOTMCP_CREDENTIALS=%SCRIPT_DIR%..\..\private\credential.yml
 
 :: Check Zotero connection
 echo.
