@@ -2112,22 +2112,24 @@ async def add_from_file(
 
 @mcp.tool(
     name="zotero_find_duplicates",
-    description="Find potential duplicate items in the library.",
+    description="Find potential duplicate items in the library using multiple matching strategies.",
 )
 async def find_duplicates(
-    method: str = "title",
+    method: str = "all",
     collection_key: Optional[str] = None,
-    limit: int = 50,
+    limit: int = 500,
+    exclude_types: Optional[list[str]] = None,
     *,
     ctx: Context,
 ) -> str:
     """
-    Find duplicate items.
+    Find duplicate items with enhanced matching.
 
     Args:
-        method: Matching method: 'title' (normalized title), 'doi' (exact DOI), 'both'.
+        method: Matching method: 'title', 'doi', 'author_year', 'isbn', 'all' (default).
         collection_key: Limit search to a collection.
-        limit: Maximum items to scan.
+        limit: Maximum items to scan (default 500).
+        exclude_types: Item types to exclude (default: note, attachment, annotation).
         ctx: MCP context.
     """
     ctx.info(f"Finding duplicates (method={method}, limit={limit})")
@@ -2145,53 +2147,131 @@ async def find_duplicates(
     if not items:
         return "No items found to check."
 
-    # Group by key
+    # Filter out notes, attachments, annotations
+    skip = set(exclude_types or ["note", "attachment", "annotation"])
+    items = [i for i in items if i.item_type not in skip]
+
+    if not items:
+        return "No matchable items after filtering."
+
+    import re as _re
     from collections import defaultdict
+
+    def _normalize_doi(doi):
+        if not doi:
+            return None
+        d = doi.strip().lower()
+        for prefix in ["https://doi.org/", "http://doi.org/", "doi:", "doi.org/"]:
+            if d.startswith(prefix):
+                d = d[len(prefix):]
+        return d.strip() if d else None
+
+    def _normalize_title(title):
+        if not title:
+            return None
+        t = title.lower().strip()
+        t = _re.sub(r"[^\w\s]", "", t)
+        t = _re.sub(r"\s+", " ", t).strip()
+        for article in ["a ", "an ", "the "]:
+            if t.startswith(article):
+                t = t[len(article):]
+        return t if len(t) > 3 else None
+
+    def _author_year_key(item):
+        creators = item.format_creators()
+        first = creators.split(",")[0].strip().lower() if creators else ""
+        year = ""
+        if item.date:
+            m = _re.search(r"(\d{4})", item.date)
+            if m:
+                year = m.group(1)
+        return f"{first}_{year}" if first and year else None
+
+    def _get_isbn(item):
+        if not item.raw_data:
+            return None
+        isbn = item.raw_data.get("data", {}).get("ISBN", "")
+        return isbn.strip().replace("-", "") if isbn else None
+
+    # Build groups
     title_groups = defaultdict(list)
     doi_groups = defaultdict(list)
+    author_year_groups = defaultdict(list)
+    isbn_groups = defaultdict(list)
 
     for item in items:
-        if method in ("title", "both"):
-            # Normalize title: lowercase, strip punctuation, collapse whitespace
-            import re
-            norm_title = re.sub(r"[^\w\s]", "", item.title.lower()).strip()
-            norm_title = re.sub(r"\s+", " ", norm_title)
-            if norm_title:
-                title_groups[norm_title].append(item)
+        if method in ("title", "all"):
+            nt = _normalize_title(item.title)
+            if nt:
+                title_groups[nt].append(item)
 
-        if method in ("doi", "both") and item.doi:
-            doi_groups[item.doi.lower().strip()].append(item)
+        if method in ("doi", "all"):
+            nd = _normalize_doi(item.doi)
+            if nd:
+                doi_groups[nd].append(item)
 
-    # Collect duplicate groups
+        if method in ("author_year", "all"):
+            ay = _author_year_key(item)
+            if ay:
+                author_year_groups[ay].append(item)
+
+        if method in ("isbn", "all"):
+            isbn = _get_isbn(item)
+            if isbn:
+                isbn_groups[isbn].append(item)
+
+    # Collect groups, deduplicate across match types
+    seen = set()
     dup_groups = []
 
-    for key, group in title_groups.items():
-        if len(group) >= 2:
-            dup_groups.append({
-                "matchType": "title",
-                "matchValue": key,
-                "items": [
-                    {"key": i.key, "title": i.title, "date": i.date, "creators": i.format_creators()}
-                    for i in group
-                ],
-            })
+    def _add_group(match_type, confidence, key, group):
+        if len(group) < 2:
+            return
+        keys = tuple(sorted(i.key for i in group))
+        if keys in seen:
+            return
+        seen.add(keys)
+        dup_groups.append({
+            "matchType": match_type,
+            "confidence": confidence,
+            "matchValue": key[:80],
+            "count": len(group),
+            "items": [
+                {
+                    "key": i.key,
+                    "title": i.title[:80],
+                    "type": i.item_type,
+                    "date": i.date,
+                    "creators": i.format_creators()[:50],
+                }
+                for i in group
+            ],
+        })
 
-    for key, group in doi_groups.items():
-        if len(group) >= 2:
-            dup_groups.append({
-                "matchType": "doi",
-                "matchValue": key,
-                "items": [
-                    {"key": i.key, "title": i.title, "date": i.date, "doi": i.doi}
-                    for i in group
-                ],
-            })
+    for k, g in doi_groups.items():
+        _add_group("doi", "high", k, g)
+    for k, g in isbn_groups.items():
+        _add_group("isbn", "high", k, g)
+    for k, g in title_groups.items():
+        _add_group("title", "medium", k, g)
+    for k, g in author_year_groups.items():
+        if len(g) >= 3:
+            _add_group("author_year", "low", k, g)
+
+    # Sort by confidence then count
+    conf_order = {"high": 0, "medium": 1, "low": 2}
+    dup_groups.sort(key=lambda g: (conf_order.get(g["confidence"], 3), -g["count"]))
 
     if not dup_groups:
         return f"No duplicates found among {len(items)} items."
     return json.dumps({
         "totalScanned": len(items),
         "duplicateGroups": len(dup_groups),
+        "byConfidence": {
+            "high": sum(1 for g in dup_groups if g["confidence"] == "high"),
+            "medium": sum(1 for g in dup_groups if g["confidence"] == "medium"),
+            "low": sum(1 for g in dup_groups if g["confidence"] == "low"),
+        },
         "groups": dup_groups,
     }, indent=2, ensure_ascii=False)
 
