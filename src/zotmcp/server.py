@@ -2447,6 +2447,175 @@ async def search_by_citation_key(
     return json.dumps(matches, indent=2, ensure_ascii=False)
 
 
+
+@mcp.tool(
+    name="zotero_find_duplicate_pdfs",
+    description="Find duplicate PDF attachments by SHA-256 content hash. Reads directly from Zotero storage directory for speed.",
+)
+async def find_duplicate_pdfs(
+    limit: int = 500,
+    collection_key: Optional[str] = None,
+    storage_path: Optional[str] = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Find duplicate PDFs by file content hash.
+
+    Scans Zotero's storage directory to compute SHA-256 hashes of all PDFs,
+    then groups identical files. Much faster than downloading via API.
+
+    Args:
+        limit: Maximum number of parent items to scan.
+        collection_key: Limit to a specific collection.
+        storage_path: Override Zotero storage path (auto-detected if not set).
+        ctx: MCP context.
+    """
+    import hashlib
+    from pathlib import Path
+
+    ctx.info(f"Scanning for duplicate PDFs (limit={limit})")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Auto-detect storage path
+    if not storage_path:
+        # Common Zotero data directories on Windows
+        candidates = [
+            Path(r"D:/Zotero/ZoteroDB/storage"),
+            Path(os.path.expandvars(r"%USERPROFILE%/Zotero/storage")),
+            Path(r"C:/Users/KBO/Zotero/storage"),
+        ]
+        for p in candidates:
+            if p.is_dir():
+                storage_path = str(p)
+                break
+
+    if not storage_path or not Path(storage_path).is_dir():
+        return "Error: Zotero storage directory not found. Set storage_path parameter."
+
+    storage_dir = Path(storage_path)
+    ctx.info(f"Using storage: {storage_dir}")
+
+    # Get items to map keys to metadata
+    if collection_key:
+        items = await client.get_collection_items(collection_key, limit=limit)
+    else:
+        items = await client.get_all_items(limit=limit)
+
+    # Build parent lookup: attachment_key -> parent info
+    att_to_parent = {}
+    for item in items:
+        children = await client.get_item_children(item.key)
+        for child in children:
+            raw = child.raw_data or {}
+            data = raw.get("data", {})
+            ct = data.get("contentType", "")
+            if ct == "application/pdf" or (
+                child.item_type == "attachment"
+                and (child.title.lower().endswith(".pdf") or data.get("filename", "").lower().endswith(".pdf"))
+            ):
+                att_to_parent[child.key] = {
+                    "att_key": child.key,
+                    "att_title": child.title,
+                    "filename": data.get("filename", child.title),
+                    "parent_key": item.key,
+                    "parent_title": item.title,
+                    "parent_type": item.item_type,
+                    "parent_creators": item.format_creators()[:60],
+                }
+
+    ctx.info(f"Found {len(att_to_parent)} PDF attachments across {len(items)} items")
+
+    if len(att_to_parent) < 2:
+        return f"Found {len(att_to_parent)} PDF(s). Need at least 2 to check."
+
+    # Phase 1: Scan storage directory, compute file sizes
+    file_info = {}  # key -> {path, size}
+    for att_key in att_to_parent:
+        key_dir = storage_dir / att_key
+        if key_dir.is_dir():
+            for f in key_dir.iterdir():
+                if f.suffix.lower() == ".pdf" and f.is_file():
+                    file_info[att_key] = {"path": f, "size": f.stat().st_size}
+                    break
+
+    ctx.info(f"Found {len(file_info)} PDFs on disk")
+
+    # Phase 2: Group by file size (quick pre-filter)
+    size_groups = {}
+    for key, info in file_info.items():
+        size_groups.setdefault(info["size"], []).append(key)
+
+    # Only hash files that share a size with at least one other
+    to_hash = set()
+    for size, keys in size_groups.items():
+        if len(keys) >= 2:
+            to_hash.update(keys)
+
+    ctx.info(f"Hashing {len(to_hash)} PDFs with matching sizes...")
+
+    # Phase 3: Compute SHA-256 for candidates
+    hash_groups = {}
+    for key in to_hash:
+        path = file_info[key]["path"]
+        try:
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            hash_groups.setdefault(sha, []).append(key)
+        except Exception:
+            pass
+
+    # Collect duplicate groups
+    dup_groups = []
+    total_wasted = 0
+    for sha, keys in hash_groups.items():
+        if len(keys) >= 2:
+            files = []
+            for k in keys:
+                info = att_to_parent.get(k, {})
+                size = file_info[k]["size"]
+                files.append({
+                    "attachmentKey": k,
+                    "filename": info.get("filename", "?"),
+                    "size": size,
+                    "sizeHuman": f"{size/1024/1024:.1f} MB" if size > 1024*1024 else f"{size/1024:.0f} KB",
+                    "parentKey": info.get("parent_key", "?"),
+                    "parentTitle": info.get("parent_title", "?")[:80],
+                    "parentType": info.get("parent_type", "?"),
+                    "parentCreators": info.get("parent_creators", ""),
+                })
+            wasted = file_info[keys[0]]["size"] * (len(keys) - 1)
+            total_wasted += wasted
+            dup_groups.append({
+                "sha256": sha[:16] + "...",
+                "count": len(keys),
+                "fileSize": files[0]["sizeHuman"],
+                "wastedSpace": f"{wasted/1024/1024:.1f} MB" if wasted > 1024*1024 else f"{wasted/1024:.0f} KB",
+                "files": files,
+            })
+
+    dup_groups.sort(key=lambda g: -g["count"])
+
+    result = {
+        "storagePath": str(storage_dir),
+        "totalItems": len(items),
+        "totalPDFs": len(att_to_parent),
+        "pdfsOnDisk": len(file_info),
+        "candidatesHashed": len(to_hash),
+        "duplicateGroups": len(dup_groups),
+        "totalWastedSpace": f"{total_wasted/1024/1024:.1f} MB",
+    }
+
+    if not dup_groups:
+        result["message"] = "No duplicate PDFs found."
+    else:
+        result["groups"] = dup_groups
+
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
 def create_server() -> FastMCP:
     """Create and return the MCP server instance."""
     return mcp
