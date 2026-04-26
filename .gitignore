@@ -111,3 +111,5 @@ pip-delete-this-directory.txt
 # ©¤©¤ Temporary output files ©¤©¤  
 *.err  
 *.out 
+patch_fix_config.py  
+patch_split_server.py  
