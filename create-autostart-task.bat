@@ -5,7 +5,7 @@
 echo Creating ZotMCP auto-start scheduled task...
 echo.
 
-schtasks /create /tn "ZotMCP-AutoStart" /tr "F:\code\tools\mng\publish\zotmcp\autostart-zotmcp.bat" /sc onlogon /rl highest /f
+schtasks /create /tn "ZotMCP-AutoStart" /tr "%~dp0autostart-zotmcp.bat" /sc onlogon /rl highest /f
 
 if %errorlevel%==0 (
     echo.
