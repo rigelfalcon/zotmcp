@@ -284,8 +284,14 @@ async def get_item_metadata(
             "report": "techreport",
         }.get(item.item_type, "misc")
 
+        def _bib_escape(s):
+            """Escape special BibTeX characters."""
+            if not s:
+                return s
+            return s.replace('\\', '\\textbackslash{}').replace('{', '\\{').replace('}', '\\}').replace('&', '\\&').replace('%', '\\%').replace('#', '\\#')
+
         lines = [f"@{bibtex_type}{{{item.key},"]
-        lines.append(f"  title = {{{item.title}}},")
+        lines.append(f"  title = {{{_bib_escape(item.title)}}},")
         lines.append(f"  author = {{{item.format_creators()}}},")
         if item.date:
             lines.append(f"  year = {{{item.date[:4] if len(item.date) >= 4 else item.date}}},")
@@ -1747,6 +1753,35 @@ async def delete_note(
     return f"Failed to trash note `{item_key}`."
 
 
+
+
+@mcp.tool(
+    name="zotero_trash_item",
+    description="Move any Zotero item (not just notes) to trash by its key.",
+)
+async def trash_item(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Move an item to the Zotero trash.
+
+    Args:
+        item_key: The key of the item to trash.
+        ctx: MCP context.
+    """
+    ctx.info(f"Trashing item: {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    success = await client.trash_item(item_key)
+    if success:
+        return f"Item `{item_key}` moved to trash."
+    return f"Failed to trash item `{item_key}`."
+
 # =============================================================================
 # Annotations Tools (Group 2)
 # =============================================================================
@@ -2002,11 +2037,37 @@ async def add_by_url(
         tags: Tags to apply.
         ctx: MCP context.
     """
-    ctx.info(f"Adding web page: {url}")
+    ctx.info(f"Adding by URL: {url}")
     client = get_client()
 
     if not await client.is_available():
         return "Error: Zotero is not available."
+
+    # Detect DOI URLs and delegate to add_by_doi
+    import re as _re
+    doi_match = _re.search(
+        r'(?:doi\.org/|/doi/)(.+?)(?:\?|#|$)',
+        url, _re.IGNORECASE
+    )
+    if not doi_match:
+        doi_match = _re.search(r'(10\.\d{4,}/[^\s?#]+)', url)
+    if doi_match:
+        from urllib.parse import unquote
+        doi = unquote(doi_match.group(1).rstrip('/'))
+        ctx.info(f"Detected DOI in URL: {doi}, delegating to add_by_doi")
+        from zotmcp.crossref import fetch_crossref_metadata
+        item_data_doi = await fetch_crossref_metadata(doi)
+        if item_data_doi:
+            if collections:
+                item_data_doi["collections"] = collections
+            if tags:
+                item_data_doi["tags"] = [{"tag": t} for t in tags]
+            key = await client.create_item_raw(item_data_doi)
+            if key:
+                title = item_data_doi.get("title", "Unknown")
+                return f"Created item `{key}`: {title}\nDOI: {doi}"
+            return f"Failed to create item for DOI `{doi}`."
+        return f"Failed to fetch metadata for DOI `{doi}`. Check the DOI is valid."
 
     item_data = {
         "itemType": "webpage",
@@ -2752,6 +2813,1624 @@ async def find_duplicate_pdfs(
         result["groups"] = dup_groups
 
     return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+
+# =============================================================================
+# Item Update Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_update_item",
+    description="Update fields of an existing Zotero item (title, itemType, date, journal, etc.).",
+)
+async def update_item_fields(
+    item_key: str,
+    fields: dict,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Update one or more fields of a Zotero item.
+
+    Args:
+        item_key: The key of the item to update.
+        fields: Dict of field names to new values (e.g. {"title": "New Title", "itemType": "journalArticle"}).
+        ctx: MCP context.
+    """
+    if not isinstance(fields, dict) or not fields:
+        return "Error: fields must be a non-empty dict."
+
+    PROTECTED = {"key", "version", "dateAdded", "dateModified"}
+    bad = PROTECTED & set(fields.keys())
+    if bad:
+        return f"Error: cannot modify protected fields: {bad}"
+
+    ctx.info(f"Updating item {item_key}: {list(fields.keys())}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    success = await client.update_item(item_key, fields)
+    if success:
+        return f"Updated item `{item_key}`: {', '.join(f'{k}={v!r}' for k, v in fields.items())}"
+    return f"Failed to update item `{item_key}`. Check the key and field names are valid."
+
+
+# =============================================================================
+# Batch BibTeX Export Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_batch_export_bibtex",
+    description="Export multiple Zotero items as combined BibTeX by their keys.",
+)
+async def batch_export_bibtex(
+    item_keys: list[str],
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Export a batch of Zotero items as BibTeX.
+
+    Args:
+        item_keys: List of Zotero item keys to export.
+        ctx: MCP context.
+    """
+    ctx.info(f"Exporting {len(item_keys)} items as BibTeX")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    results = []
+    errors = []
+
+    for key in item_keys:
+        item = await client.get_item(key)
+        if not item:
+            errors.append(f"% Item not found: {key}")
+            continue
+
+        # Generate BibTeX
+        bibtex_type = {
+            "journalArticle": "article",
+            "book": "book",
+            "bookSection": "incollection",
+            "conferencePaper": "inproceedings",
+            "thesis": "phdthesis",
+            "report": "techreport",
+            "preprint": "article",
+            "webpage": "misc",
+        }.get(item.item_type, "misc")
+
+        def _bib_escape(s):
+            """Escape special BibTeX characters."""
+            if not s:
+                return s
+            return s.replace('\\', '\\textbackslash{}').replace('{', '\\{').replace('}', '\\}').replace('&', '\\&').replace('%', '\\%').replace('#', '\\#')
+
+        lines = [f"@{bibtex_type}{{{item.key},"]
+        lines.append(f"  title = {{{_bib_escape(item.title)}}},")
+        lines.append(f"  author = {{{item.format_creators()}}},")
+        if item.date:
+            lines.append(f"  year = {{{item.date[:4] if len(item.date) >= 4 else item.date}}},")
+
+        raw = item.raw_data or {}
+        data = raw.get("data", raw)
+
+        for field, bib_field in [
+            ("publicationTitle", "journal"),
+            ("proceedingsTitle", "booktitle"),
+            ("volume", "volume"),
+            ("issue", "number"),
+            ("pages", "pages"),
+            ("publisher", "publisher"),
+            ("DOI", "doi"),
+            ("url", "url"),
+            ("ISBN", "isbn"),
+            ("ISSN", "issn"),
+            ("abstractNote", "abstract"),
+        ]:
+            val = data.get(field, "")
+            if val:
+                lines.append(f"  {bib_field} = {{{val}}},")
+
+        lines.append("}")
+        results.append("\n".join(lines))
+
+    output = "\n\n".join(results)
+    if errors:
+        output = "\n".join(errors) + "\n\n" + output
+    return output
+
+
+# =============================================================================
+# PDF Fetch Tool (Unpaywall + SciHub fallback)
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_fetch_pdf",
+    description="Fetch PDF for a Zotero item by DOI via Unpaywall (open access) or Sci-Hub, and attach it.",
+)
+async def fetch_pdf_for_item(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Fetch PDF for an item and attach to Zotero.
+
+    Tries Unpaywall (open access) first, then Sci-Hub as fallback.
+
+    Args:
+        item_key: The key of the Zotero item.
+        ctx: MCP context.
+    """
+    import tempfile
+    import os
+    import httpx
+
+    ctx.info(f"Fetching PDF for item {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    item = await client.get_item(item_key)
+    if not item:
+        return f"Item `{item_key}` not found."
+
+    raw_data = (item.raw_data or {}).get("data", item.raw_data or {})
+    doi = raw_data.get("DOI", "")
+    item_url = raw_data.get("url", "")
+    archive_id = raw_data.get("archiveID", "")
+
+    if not doi and not item_url:
+        return f"Item `{item_key}` has no DOI or URL. Cannot fetch PDF."
+
+    ctx.info(f"DOI: {doi}, URL: {item_url}")
+
+    pdf_url = None
+    pdf_data = None
+    source = ""
+
+    # Try 0: Direct preprint PDF (arXiv, bioRxiv)
+    import re as _re
+    arxiv_id = None
+    if archive_id and "arXiv:" in archive_id:
+        arxiv_id = archive_id.replace("arXiv:", "")
+    elif doi and doi.startswith("10.48550/"):
+        m = _re.search(r"arXiv\.(\d+\.\d+)", doi, _re.IGNORECASE)
+        if m:
+            arxiv_id = m.group(1)
+    elif item_url and "arxiv.org" in item_url:
+        m = _re.search(r"arxiv\.org/abs/(\d+\.\d+)", item_url)
+        if m:
+            arxiv_id = m.group(1)
+
+    if arxiv_id:
+        try:
+            arxiv_pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            ctx.info(f"Trying arXiv direct: {arxiv_pdf_url}")
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
+                resp = await http.get(arxiv_pdf_url)
+                if resp.status_code == 200 and len(resp.content) > 5000:
+                    pdf_data = resp.content
+                    source = "arXiv (direct)"
+        except Exception as e:
+            ctx.info(f"arXiv direct failed: {e}")
+
+    if not pdf_data and doi and doi.startswith("10.1101/"):
+        try:
+            biorxiv_pdf_url = f"https://www.biorxiv.org/content/{doi}v1.full.pdf"
+            ctx.info(f"Trying bioRxiv direct: {biorxiv_pdf_url}")
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
+                resp = await http.get(biorxiv_pdf_url)
+                if resp.status_code == 200 and len(resp.content) > 5000:
+                    pdf_data = resp.content
+                    source = "bioRxiv (direct)"
+        except Exception as e:
+            ctx.info(f"bioRxiv direct failed: {e}")
+
+    # Try 1: Unpaywall (open access)
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http:
+            unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email=zotmcp@example.com"
+            ctx.info(f"Checking Unpaywall...")
+            resp = await http.get(unpaywall_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                best_oa = data.get("best_oa_location") or {}
+                pdf_url = best_oa.get("url_for_pdf") or best_oa.get("url")
+                if pdf_url:
+                    source = "Unpaywall (open access)"
+                    ctx.info(f"Found OA PDF: {pdf_url}")
+    except Exception as e:
+        ctx.info(f"Unpaywall failed: {e}")
+
+    # Try 2: Sci-Hub
+    if not pdf_url:
+        scihub_domains = ["sci-hub.se", "sci-hub.st", "sci-hub.ru"]
+        for domain in scihub_domains:
+            try:
+                scihub_url = f"https://{domain}/{doi}"
+                ctx.info(f"Trying Sci-Hub ({domain})...")
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
+                    resp = await http.get(scihub_url)
+                    if resp.status_code == 200 and "application/pdf" in resp.headers.get("content-type", ""):
+                        # Direct PDF response
+                        pdf_data = resp.content
+                        source = f"Sci-Hub ({domain})"
+                        break
+                    elif resp.status_code == 200:
+                        # Parse HTML for PDF: embed src, iframe, or button onclick
+                        import re as _re2
+                        # Sci-Hub typically uses <embed> or <iframe> with src
+                        for pattern in [
+                            r'<embed[^>]+src=["\'](/[^"\'>]+)["\'\s>]',
+                            r'<iframe[^>]+src=["\'](/[^"\'>]+)["\'\s>]',
+                            r'<embed[^>]+src=["\']([^"\'>]+)["\']',
+                            r'<iframe[^>]+src=["\']([^"\'>]+)["\']',
+                            r'(?:src|href)=["\']([^"\'>]*\.pdf[^"\'>]*)',
+                            r'(?:src|href)=["\']([^"\'>]*/downloads?/[^"\'>]*)',
+                        ]:
+                            pdf_match = _re2.search(pattern, resp.text, _re2.IGNORECASE)
+                            if pdf_match:
+                                pdf_url = pdf_match.group(1)
+                                if pdf_url.startswith("//"):
+                                    pdf_url = "https:" + pdf_url
+                                elif pdf_url.startswith("/"):
+                                    pdf_url = f"https://{domain}{pdf_url}"
+                                source = f"Sci-Hub ({domain})"
+                                break
+                        if source:
+                            break
+            except Exception:
+                continue
+
+    if not pdf_data and not pdf_url:
+        return f"No PDF found for DOI `{doi}`. Tried Unpaywall and Sci-Hub."
+
+    # Download PDF if we only have URL
+    try:
+        if pdf_data is None and pdf_url:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http:
+                ctx.info(f"Downloading PDF from {source}...")
+                resp = await http.get(pdf_url)
+                resp.raise_for_status()
+                pdf_data = resp.content
+    except Exception as e:
+        return f"Failed to download PDF: {e}"
+
+    if len(pdf_data) < 1000:
+        return f"Downloaded file too small ({len(pdf_data)} bytes), likely not a valid PDF."
+
+    # Save as linked file in Zotero's linked attachment base directory
+    from zotmcp.utils import get_zotero_base_attachment_path
+    linked_base = get_zotero_base_attachment_path()
+
+    safe_title = "".join(c if c.isalnum() or c in " -_" else "_" for c in item.title[:80])
+    filename = f"{safe_title}.pdf"
+
+    if linked_base:
+        pdf_dir = os.path.join(linked_base, safe_title)
+        os.makedirs(pdf_dir, exist_ok=True)
+        pdf_path = os.path.join(pdf_dir, filename)
+    else:
+        # Fallback to temp dir if no linked base
+        pdf_dir = tempfile.mkdtemp()
+        pdf_path = os.path.join(pdf_dir, filename)
+
+    with open(pdf_path, "wb") as f:
+        f.write(pdf_data)
+
+    size_kb = len(pdf_data) / 1024
+    ctx.info(f"Saved PDF to {pdf_path} ({size_kb:.0f} KB)")
+
+    # Create linked file attachment in Zotero via Web API
+    try:
+        from zotmcp.clients import ZoteroWebClient
+        if hasattr(client, '_web_client') and isinstance(client._web_client, ZoteroWebClient):
+            zot = client._web_client._get_zot()
+        elif isinstance(client, ZoteroWebClient):
+            zot = client._get_zot()
+        else:
+            return f"PDF saved to `{pdf_path}` ({size_kb:.0f} KB) but cannot create linked attachment: unsupported client type."
+
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        # Build relative path from linked base for Zotero's "attachments:" prefix
+        if linked_base:
+            rel_path = os.path.relpath(pdf_path, linked_base)
+            zotero_path = f"attachments:{rel_path}"
+        else:
+            zotero_path = pdf_path
+
+        def _create_linked():
+            template = zot.item_template("attachment", "linked_file")
+            template["title"] = filename
+            template["path"] = zotero_path
+            template["contentType"] = "application/pdf"
+            template["parentItem"] = item_key
+            resp = zot.create_items([template])
+            return resp
+
+        resp = await loop.run_in_executor(None, _create_linked)
+
+        # Check success
+        success_keys = resp.get("successful", resp.get("success", {}))
+        if success_keys:
+            attach_key = list(success_keys.values())[0] if isinstance(success_keys, dict) else "unknown"
+            return f"PDF linked to `{item_key}` ({size_kb:.0f} KB) via {source}.\nPath: `{pdf_path}`"
+        else:
+            failed = resp.get("failed", {})
+            return f"PDF saved to `{pdf_path}` ({size_kb:.0f} KB) but linked attachment creation failed: {failed}"
+    except Exception as e:
+        return f"PDF saved to `{pdf_path}` ({size_kb:.0f} KB) but link failed: {e}. Create linked attachment manually in Zotero."
+
+
+
+# =============================================================================
+# Citation Rendering Tools
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_cite",
+    description="Generate a formatted citation or bibliography entry for a Zotero item using a CSL style (e.g., apa, nature, vancouver). Uses Zotero's built-in CSL engine.",
+)
+async def cite_item(
+    item_key: str,
+    style: str = "apa",
+    format: Literal["citation", "bibliography"] = "bibliography",
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Render a formatted citation or bibliography entry.
+
+    Args:
+        item_key: Zotero item key.
+        style: CSL style name (e.g., apa, nature, vancouver, chicago-author-date, ieee).
+        format: 'citation' for inline citation, 'bibliography' for full reference.
+        ctx: MCP context.
+    """
+    import httpx, re
+    ctx.info(f"Rendering {format} for {item_key} in {style} style")
+
+    # Use Zotero Local API for CSL rendering
+    if format == "bibliography":
+        url = f"http://127.0.0.1:23119/api/users/0/items/{item_key}?format=bib&style={style}"
+    else:
+        url = f"http://127.0.0.1:23119/api/users/0/items/{item_key}?format=citation&style={style}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get(url)
+            if resp.status_code == 200:
+                text = resp.text.strip()
+                # Strip HTML tags
+                text = re.sub(r'<[^>]+>', '', text).strip()
+                return text
+            else:
+                return f"Failed to render citation (HTTP {resp.status_code}). Is Zotero running?"
+    except Exception as e:
+        return f"Failed to render citation: {e}"
+
+
+# =============================================================================
+# PMID Import Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_add_by_pmid",
+    description="Add a paper to Zotero by PubMed ID (PMID). Fetches metadata from NCBI E-utilities.",
+)
+async def add_by_pmid(
+    pmid: str,
+    collections: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Add a paper by PubMed ID.
+
+    Args:
+        pmid: PubMed ID (numeric string, e.g., '12345678').
+        collections: Optional collection keys.
+        tags: Optional tags.
+        ctx: MCP context.
+    """
+    import httpx, re
+    ctx.info(f"Adding item by PMID: {pmid}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Fetch metadata from NCBI E-utilities (efetch)
+    efetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.get(efetch_url)
+            resp.raise_for_status()
+            xml = resp.text
+    except Exception as e:
+        return f"Failed to fetch PubMed metadata: {e}"
+
+    # Parse XML for key fields
+    def xml_text(tag):
+        m = re.search(f'<{tag}[^>]*>(.+?)</{tag}>', xml, re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    title = xml_text("ArticleTitle")
+    journal = xml_text("Title")  # journal full title
+    volume = xml_text("Volume")
+    issue = xml_text("Issue")
+    year = xml_text("Year")
+    pages_start = xml_text("MedlinePgn")
+
+    # Parse authors
+    creators = []
+    for m in re.finditer(r'<Author[^>]*>.*?<LastName>(.+?)</LastName>.*?<ForeName>(.+?)</ForeName>.*?</Author>', xml, re.DOTALL):
+        creators.append({"creatorType": "author", "lastName": m.group(1), "firstName": m.group(2)})
+
+    # Extract DOI if available
+    doi_m = re.search(r'<ArticleId IdType="doi">(.+?)</ArticleId>', xml)
+    doi = doi_m.group(1) if doi_m else ""
+
+    if not title:
+        return f"No article found for PMID {pmid}."
+
+    item_data = {
+        "itemType": "journalArticle",
+        "title": title,
+        "creators": creators,
+        "date": year,
+        "publicationTitle": journal,
+        "volume": volume,
+        "issue": issue,
+        "pages": pages_start,
+        "DOI": doi,
+        "extra": f"PMID: {pmid}",
+        "tags": [{"tag": t} for t in (tags or [])],
+        "collections": collections or [],
+    }
+
+    key = await client.create_item_raw(item_data)
+    if key:
+        return f"Created item `{key}`: {title}\nPMID: {pmid}" + (f"\nDOI: {doi}" if doi else "")
+    return f"Failed to create item for PMID {pmid}."
+
+
+# =============================================================================
+# Collection Stats Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_collection_stats",
+    description="Get statistics for a Zotero collection: item count, PDF coverage, year distribution, top journals.",
+)
+async def collection_stats(
+    collection_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Get collection statistics.
+
+    Args:
+        collection_key: Zotero collection key.
+        ctx: MCP context.
+    """
+    from collections import Counter
+    ctx.info(f"Computing stats for collection {collection_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    items = await client.get_collection_items(collection_key, limit=500)
+    if not items:
+        return f"Collection `{collection_key}` is empty or not found."
+
+    total = len(items)
+    types = Counter()
+    years = Counter()
+    journals = Counter()
+    has_pdf = 0
+
+    for item in items:
+        types[item.item_type] += 1
+        if item.date:
+            year = item.date[:4]
+            if year.isdigit():
+                years[year] += 1
+        raw = (item.raw_data or {}).get("data", {})
+        journal = raw.get("publicationTitle", "")
+        if journal:
+            journals[journal] += 1
+        children = await client.get_item_children(item.key)
+        for child in children:
+            if child.item_type == "attachment" and "pdf" in (child.title or "").lower():
+                has_pdf += 1
+                break
+
+    lines = [f"## Collection Stats ({total} items)\n"]
+    lines.append(f"**PDF coverage:** {has_pdf}/{total} ({100*has_pdf//total if total else 0}%)\n")
+    lines.append("**Item types:**")
+    for t, c in types.most_common():
+        lines.append(f"  - {t}: {c}")
+    lines.append("\n**Year distribution (top 10):**")
+    for y, c in sorted(years.items(), reverse=True)[:10]:
+        lines.append(f"  - {y}: {c}")
+    lines.append("\n**Top journals:**")
+    for j, c in journals.most_common(10):
+        lines.append(f"  - {j}: {c}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Remove from Collection Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_remove_from_collection",
+    description="Remove an item from a collection (does NOT trash the item, just unlinks it from the collection).",
+)
+async def remove_from_collection(
+    item_key: str,
+    collection_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Remove an item from a collection.
+
+    Args:
+        item_key: Zotero item key.
+        collection_key: Collection key to remove from.
+        ctx: MCP context.
+    """
+    import httpx
+    ctx.info(f"Removing {item_key} from collection {collection_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Get current item to find its collections and version
+    item = await client.get_item(item_key)
+    if not item:
+        return f"Item `{item_key}` not found."
+
+    raw = (item.raw_data or {}).get("data", {})
+    current_collections = raw.get("collections", [])
+
+    if collection_key not in current_collections:
+        return f"Item `{item_key}` is not in collection `{collection_key}`."
+
+    new_collections = [c for c in current_collections if c != collection_key]
+    success = await client.update_item(item_key, {"collections": new_collections})
+
+    if success:
+        return f"Removed `{item_key}` from collection `{collection_key}`."
+    return f"Failed to remove `{item_key}` from collection."
+
+
+# =============================================================================
+# Library Stats Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_library_stats",
+    description="Get overall library statistics: total items, type breakdown, tag count, collection count.",
+)
+async def library_stats(
+    *,
+    ctx: Context,
+) -> str:
+    """Get library-wide statistics."""
+    ctx.info("Computing library stats")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    collections = await client.get_collections()
+    tags = await client.get_tags()
+    recent = await client.get_all_items(limit=500)
+
+    from collections import Counter
+    types = Counter(item.item_type for item in recent)
+
+    lines = [f"## Library Statistics\n"]
+    lines.append(f"**Total items (sampled):** {len(recent)}")
+    lines.append(f"**Collections:** {len(collections)}")
+    lines.append(f"**Tags:** {len(tags)}")
+    lines.append("\n**Item types:**")
+    for t, c in types.most_common(15):
+        lines.append(f"  - {t}: {c}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Sync Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_sync",
+    description="Trigger Zotero library sync via the Local API.",
+)
+async def trigger_sync(
+    *,
+    ctx: Context,
+) -> str:
+    """Trigger a Zotero sync."""
+    import httpx
+    ctx.info("Triggering Zotero sync")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.post("http://127.0.0.1:23119/connector/triggerSync")
+            if resp.status_code == 200:
+                return "Sync triggered successfully."
+            return f"Sync trigger returned HTTP {resp.status_code}."
+    except Exception as e:
+        return f"Failed to trigger sync: {e}"
+
+
+
+
+# =============================================================================
+# iCite Citation Metrics Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_item_metrics",
+    description="Get NIH iCite citation metrics (citation count, Relative Citation Ratio, NIH percentile) for a Zotero item by its PMID or DOI.",
+)
+async def item_metrics(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Get citation metrics from NIH iCite API.
+
+    Args:
+        item_key: Zotero item key. The item must have a DOI or PMID in its metadata.
+        ctx: MCP context.
+    """
+    import httpx, re
+    ctx.info(f"Fetching citation metrics for {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    item = await client.get_item(item_key)
+    if not item:
+        return f"Item `{item_key}` not found."
+
+    raw = (item.raw_data or {}).get("data", {})
+    doi = raw.get("DOI", "")
+    extra = raw.get("extra", "")
+
+    # Extract PMID from extra field
+    pmid = ""
+    pmid_m = re.search(r'PMID:\s*(\d+)', extra)
+    if pmid_m:
+        pmid = pmid_m.group(1)
+
+    if not doi and not pmid:
+        return f"Item `{item_key}` has no DOI or PMID. Cannot fetch metrics."
+
+    # iCite API accepts DOI or PMID
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            if pmid:
+                resp = await http.get(f"https://icite.od.nih.gov/api/pubs?pmids={pmid}&format=csv")
+            else:
+                # First resolve DOI to PMID via NCBI
+                id_resp = await http.get(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={doi}[doi]&retmode=json")
+                if id_resp.status_code == 200:
+                    ids = id_resp.json().get("esearchresult", {}).get("idlist", [])
+                    if ids:
+                        pmid = ids[0]
+                        resp = await http.get(f"https://icite.od.nih.gov/api/pubs?pmids={pmid}&format=csv")
+                    else:
+                        return f"DOI `{doi}` not found in PubMed. iCite requires a PMID."
+                else:
+                    return f"Failed to resolve DOI to PMID."
+
+            if resp.status_code != 200:
+                return f"iCite API returned HTTP {resp.status_code}."
+
+            # Parse CSV response (header + 1 data row)
+            lines_csv = resp.text.strip().split("\n")
+            if len(lines_csv) < 2:
+                return f"No metrics found for PMID {pmid}."
+
+            headers = lines_csv[0].split(",")
+            values = lines_csv[1].split(",")
+            data = dict(zip(headers, values))
+
+            result_lines = [f"## Citation Metrics for `{item_key}`\n"]
+            result_lines.append(f"**PMID:** {pmid}")
+            result_lines.append(f"**Title:** {item.title[:80]}")
+            result_lines.append(f"**Year:** {data.get('year', 'N/A')}")
+            result_lines.append(f"**Citation Count:** {data.get('citation_count', 'N/A')}")
+            result_lines.append(f"**Relative Citation Ratio (RCR):** {data.get('relative_citation_ratio', 'N/A')}")
+            result_lines.append(f"**NIH Percentile:** {data.get('nih_percentile', 'N/A')}")
+            result_lines.append(f"**Expected Citations/Year:** {data.get('expected_citations_per_year', 'N/A')}")
+            result_lines.append(f"**Field Citation Rate:** {data.get('field_citation_rate', 'N/A')}")
+            result_lines.append(f"**Is Clinical:** {data.get('is_clinical', 'N/A')}")
+            result_lines.append(f"**Provisional:** {data.get('provisional', 'N/A')}")
+            return "\n".join(result_lines)
+    except Exception as e:
+        return f"Failed to fetch metrics: {e}"
+
+
+# =============================================================================
+# Saved Searches Tools
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_list_saved_searches",
+    description="List all saved searches in the Zotero library.",
+)
+async def list_saved_searches(
+    *,
+    ctx: Context,
+) -> str:
+    """List saved Zotero searches."""
+    import httpx
+    ctx.info("Listing saved searches")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get("http://127.0.0.1:23119/api/users/0/searches")
+            if resp.status_code == 200:
+                searches = resp.json()
+                if not searches:
+                    return "No saved searches found."
+                lines = [f"## Saved Searches ({len(searches)})\n"]
+                for s in searches:
+                    data = s.get("data", s)
+                    key = data.get("key", "?")
+                    name = data.get("name", "Untitled")
+                    conditions = data.get("conditions", [])
+                    cond_str = "; ".join(
+                        f"{c.get('condition','?')} {c.get('operator','?')} {c.get('value','')}"
+                        for c in conditions[:3]
+                    )
+                    if len(conditions) > 3:
+                        cond_str += f" (+{len(conditions)-3} more)"
+                    lines.append(f"- **{name}** (`{key}`): {cond_str}")
+                return "\n".join(lines)
+            return f"Failed to list searches (HTTP {resp.status_code})."
+    except Exception as e:
+        return f"Failed to list searches: {e}"
+
+
+@mcp.tool(
+    name="zotero_run_saved_search",
+    description="Run a saved Zotero search by its key and return matching items.",
+)
+async def run_saved_search(
+    search_key: str,
+    limit: int = 25,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Run a saved search.
+
+    Args:
+        search_key: Key of the saved search.
+        limit: Max items to return.
+        ctx: MCP context.
+    """
+    import httpx
+    ctx.info(f"Running saved search {search_key}")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            # Get search definition
+            resp = await http.get(f"http://127.0.0.1:23119/api/users/0/searches/{search_key}")
+            if resp.status_code != 200:
+                return f"Saved search `{search_key}` not found."
+            search_data = resp.json()
+            name = search_data.get("data", {}).get("name", "Untitled")
+
+            # Run the search via items endpoint
+            resp2 = await http.get(
+                f"http://127.0.0.1:23119/api/users/0/searches/{search_key}/items",
+                params={"limit": str(limit)}
+            )
+            if resp2.status_code != 200:
+                return f"Failed to run search (HTTP {resp2.status_code})."
+
+            items = resp2.json()
+            if not items:
+                return f"Search '{name}' returned no results."
+
+            lines = [f"## Search '{name}' ({len(items)} items)\n"]
+            for it in items:
+                data = it.get("data", it)
+                key = data.get("key", "?")
+                title = data.get("title", "Untitled")[:80]
+                itype = data.get("itemType", "?")
+                lines.append(f"- `{key}` ({itype}) {title}")
+            return "\n".join(lines)
+    except Exception as e:
+        return f"Failed to run search: {e}"
+
+
+# =============================================================================
+# Trash List / Restore Tools
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_list_trash",
+    description="List items in the Zotero trash.",
+)
+async def list_trash(
+    limit: int = 25,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    List trashed items.
+
+    Args:
+        limit: Max items to return.
+        ctx: MCP context.
+    """
+    import httpx
+    ctx.info("Listing trash items")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get(
+                "http://127.0.0.1:23119/api/users/0/items/trash",
+                params={"limit": str(limit)}
+            )
+            if resp.status_code == 200:
+                items = resp.json()
+                if not items:
+                    return "Trash is empty."
+                lines = [f"## Trash ({len(items)} items)\n"]
+                for it in items:
+                    data = it.get("data", it)
+                    key = data.get("key", "?")
+                    title = data.get("title", "Untitled")[:80]
+                    itype = data.get("itemType", "?")
+                    lines.append(f"- `{key}` ({itype}) {title}")
+                return "\n".join(lines)
+            return f"Failed to list trash (HTTP {resp.status_code})."
+    except Exception as e:
+        return f"Failed to list trash: {e}"
+
+
+@mcp.tool(
+    name="zotero_restore_from_trash",
+    description="Restore an item from Zotero trash back to the library.",
+)
+async def restore_from_trash(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Restore a trashed item.
+
+    Args:
+        item_key: Key of the trashed item to restore.
+        ctx: MCP context.
+    """
+    import httpx
+    ctx.info(f"Restoring {item_key} from trash")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Set deleted=0 to restore
+    # Need to get item version first via Web API
+    from zotmcp.clients import ZoteroWebClient
+    if hasattr(client, '_web_client') and isinstance(client._web_client, ZoteroWebClient):
+        zot = client._web_client._get_zot()
+    elif isinstance(client, ZoteroWebClient):
+        zot = client._get_zot()
+    else:
+        return "Restore requires Web API client."
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _get_version():
+        item = zot.item(item_key)
+        return item.get("version") or item.get("data", {}).get("version") if item else None
+
+    try:
+        version = await loop.run_in_executor(None, _get_version)
+        if not version:
+            return f"Item `{item_key}` not found in trash."
+
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            url = f"https://api.zotero.org/users/{zot.library_id}/items/{item_key}"
+            headers = {
+                "Zotero-API-Key": zot.api_key,
+                "If-Unmodified-Since-Version": str(version),
+                "Content-Type": "application/json",
+            }
+            resp = await http.patch(url, json={"deleted": 0}, headers=headers)
+            resp.raise_for_status()
+        return f"Item `{item_key}` restored from trash."
+    except Exception as e:
+        return f"Failed to restore item: {e}"
+
+
+# =============================================================================
+# Preprint Update Check Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_check_preprint_published",
+    description="Check whether a preprint (bioRxiv, arXiv) has been published in a journal. Returns the published DOI if found.",
+)
+async def check_preprint_published(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Check if a preprint has been formally published.
+
+    Args:
+        item_key: Zotero item key of the preprint.
+        ctx: MCP context.
+    """
+    import httpx, re
+    ctx.info(f"Checking preprint status for {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    item = await client.get_item(item_key)
+    if not item:
+        return f"Item `{item_key}` not found."
+
+    raw = (item.raw_data or {}).get("data", {})
+    doi = raw.get("DOI", "")
+    url = raw.get("url", "")
+
+    if not doi and not url:
+        return f"Item has no DOI or URL to check."
+
+    results = []
+
+    # Method 1: CrossRef relation check (preprint DOI -> published DOI)
+    if doi:
+        try:
+            from urllib.parse import quote
+            encoded_doi = quote(doi, safe="/")
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                resp = await http.get(
+                    f"https://api.crossref.org/works/{encoded_doi}",
+                    headers={"User-Agent": "ZotMCP/0.1.0"}
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("message", {})
+                    relations = data.get("relation", {})
+                    # Check is-preprint-of relation
+                    preprint_of = relations.get("is-preprint-of", [])
+                    for rel in preprint_of:
+                        pub_doi = rel.get("id", "")
+                        if pub_doi:
+                            results.append(f"Published version found via CrossRef: `{pub_doi}`")
+                    if not preprint_of:
+                        results.append("No published version found in CrossRef relations.")
+        except Exception as e:
+            results.append(f"CrossRef check failed: {e}")
+
+    # Method 2: bioRxiv pubs API
+    if doi and doi.startswith("10.1101/"):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                resp = await http.get(
+                    f"https://api.biorxiv.org/pubs/biorxiv/{doi}",
+                    headers={"User-Agent": "ZotMCP/0.1.0"}
+                )
+                if resp.status_code == 200:
+                    pubs = resp.json().get("collection", [])
+                    for pub in pubs:
+                        pub_doi = pub.get("published_doi", "")
+                        pub_journal = pub.get("published_journal", "")
+                        if pub_doi:
+                            results.append(f"Published in {pub_journal}: `{pub_doi}`")
+        except Exception as e:
+            results.append(f"bioRxiv pubs check failed: {e}")
+
+    # Method 3: Semantic Scholar (works for arXiv too)
+    if doi:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                resp = await http.get(
+                    f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                    params={"fields": "externalIds,journal,venue,year"}
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    ext_ids = data.get("externalIds", {})
+                    journal = data.get("journal", {})
+                    venue = data.get("venue", "")
+                    pub_doi = ext_ids.get("DOI", "")
+                    if pub_doi and pub_doi.lower() != doi.lower():
+                        results.append(f"Semantic Scholar found published DOI: `{pub_doi}`")
+                    elif journal and journal.get("name"):
+                        results.append(f"Semantic Scholar venue: {journal.get('name', venue)}")
+                    else:
+                        results.append("Semantic Scholar: no journal publication found.")
+        except Exception as e:
+            results.append(f"Semantic Scholar check failed: {e}")
+
+    if not results:
+        return f"Could not determine publication status for `{item_key}`."
+
+    header = f"## Preprint Status: {item.title[:60]}\n"
+    return header + "\n".join(results)
+
+
+# =============================================================================
+# Find Similar Items Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_find_similar",
+    description="Find items similar to a given Zotero item using semantic search on its title and abstract.",
+)
+async def find_similar_items(
+    item_key: str,
+    limit: int = 10,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Find semantically similar items to a given item.
+
+    Args:
+        item_key: Zotero item key to find similar items for.
+        limit: Max items to return.
+        ctx: MCP context.
+    """
+    ctx.info(f"Finding items similar to {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    item = await client.get_item(item_key)
+    if not item:
+        return f"Item `{item_key}` not found."
+
+    raw = (item.raw_data or {}).get("data", {})
+    abstract = raw.get("abstractNote", "")
+    query = f"{item.title}"
+    if abstract:
+        query += f" {abstract[:200]}"
+
+    # Use semantic search if available
+    try:
+        from zotmcp.semantic import SemanticSearch
+        config = get_config()
+        if hasattr(config, 'semantic_search') and config.semantic_search:
+            ss = SemanticSearch(config.semantic_search)
+            if await ss.is_available():
+                results = await ss.search(query, limit=limit + 1)
+                # Filter out the source item itself
+                results = [r for r in results if r.get("key") != item_key][:limit]
+                if not results:
+                    return f"No similar items found for `{item_key}`."
+                lines = [f"## Items similar to: {item.title[:60]}\n"]
+                for r in results:
+                    score = r.get("score", 0)
+                    title = r.get("title", "Untitled")[:80]
+                    key = r.get("key", "?")
+                    lines.append(f"- `{key}` (score: {score:.3f}) {title}")
+                return "\n".join(lines)
+    except Exception:
+        pass
+
+    # Fallback: keyword search using title words
+    words = [w for w in item.title.split() if len(w) > 4][:5]
+    search_query = " ".join(words)
+    results = await client.search_items(search_query, limit=limit + 1)
+    results = [r for r in results if r.key != item_key][:limit]
+
+    if not results:
+        return f"No similar items found for `{item_key}`."
+
+    lines = [f"## Items similar to: {item.title[:60]}\n"]
+    for r in results:
+        lines.append(f"- `{r.key}` ({r.item_type}) {r.title[:80]}")
+    return "\n".join(lines)
+
+
+# =============================================================================
+# DOCX Citation Tools
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_docx_scan_citations",
+    description="Scan a DOCX file for Zotero citation markers ({{zotero:KEY}} or Zotero field codes) and return a list of cited items.",
+)
+async def docx_scan_citations(
+    file_path: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Scan DOCX for citation markers.
+
+    Args:
+        file_path: Absolute path to DOCX file.
+        ctx: MCP context.
+    """
+    import re, zipfile, os
+    ctx.info(f"Scanning DOCX: {file_path}")
+
+    if not os.path.exists(file_path):
+        return f"File not found: {file_path}"
+
+    try:
+        # DOCX is a ZIP; read document.xml
+        with zipfile.ZipFile(file_path, 'r') as z:
+            if 'word/document.xml' not in z.namelist():
+                return "Not a valid DOCX file."
+            doc_xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
+
+        # Find {{zotero:KEY}} markers
+        template_keys = re.findall(r'\{\{zotero:([^}]+)\}\}', doc_xml)
+
+        # Find Zotero field codes (from Zotero Word plugin)
+        field_keys = re.findall(r'ADDIN ZOTERO_ITEM CSL_CITATION.*?"uris":\["[^"]*items/([A-Z0-9]+)"\]', doc_xml)
+
+        all_keys = list(dict.fromkeys(template_keys + field_keys))  # deduplicate, preserve order
+
+        if not all_keys:
+            return "No Zotero citations found in document."
+
+        lines = [f"## Citations in DOCX ({len(all_keys)} unique keys)\n"]
+        client = get_client()
+        for key in all_keys:
+            item = await client.get_item(key)
+            if item:
+                lines.append(f"- `{key}`: {item.title[:80]}")
+            else:
+                lines.append(f"- `{key}`: (not found in Zotero)")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Failed to scan DOCX: {e}"
+
+
+@mcp.tool(
+    name="zotero_docx_render_citations",
+    description="Render {{zotero:KEY}} placeholders in a DOCX file with formatted citations. Creates a new file with rendered citations.",
+)
+async def docx_render_citations(
+    file_path: str,
+    output_path: Optional[str] = None,
+    style: str = "apa",
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Render citation placeholders in DOCX.
+
+    Args:
+        file_path: Path to input DOCX.
+        output_path: Path for output DOCX. Defaults to input_rendered.docx.
+        style: CSL citation style.
+        ctx: MCP context.
+    """
+    import re, zipfile, os, shutil, httpx
+    ctx.info(f"Rendering citations in {file_path}")
+
+    if not os.path.exists(file_path):
+        return f"File not found: {file_path}"
+
+    if not output_path:
+        base, ext = os.path.splitext(file_path)
+        output_path = f"{base}_rendered{ext}"
+
+    try:
+        with zipfile.ZipFile(file_path, 'r') as z:
+            doc_xml = z.read('word/document.xml').decode('utf-8', errors='ignore')
+
+        # Find all {{zotero:KEY}} markers
+        keys = re.findall(r'\{\{zotero:([^}]+)\}\}', doc_xml)
+        if not keys:
+            return "No {{zotero:KEY}} placeholders found."
+
+        # Render each citation
+        replacements = {}
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            for key in set(keys):
+                url = f"http://127.0.0.1:23119/api/users/0/items/{key}?format=citation&style={style}"
+                resp = await http.get(url)
+                if resp.status_code == 200:
+                    citation = re.sub(r'<[^>]+>', '', resp.text).strip()
+                    replacements[key] = citation
+                else:
+                    replacements[key] = f"[{key}]"
+
+        # Replace placeholders
+        for key, citation in replacements.items():
+            doc_xml = doc_xml.replace(f"{{{{zotero:{key}}}}}", citation)
+
+        # Rebuild DOCX (replace word/document.xml, not append duplicate)
+        import tempfile as _tmp
+        tmp_path = _tmp.mktemp(suffix='.docx')
+        with zipfile.ZipFile(file_path, 'r') as zin, zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item_info in zin.infolist():
+                if item_info.filename == 'word/document.xml':
+                    zout.writestr(item_info, doc_xml.encode('utf-8'))
+                else:
+                    zout.writestr(item_info, zin.read(item_info.filename))
+        shutil.move(tmp_path, output_path)
+
+        return f"Rendered {len(replacements)} citations in `{output_path}` using {style} style."
+    except Exception as e:
+        return f"Failed to render citations: {e}"
+
+
+
+
+# =============================================================================
+# Batch PDF Export Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_export_pdfs",
+    description="Export PDFs for multiple items to a target folder. Resolves linked/stored attachment paths.",
+)
+async def export_pdfs(
+    item_keys: list[str],
+    target_folder: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Export PDFs for a list of items to a folder.
+
+    Args:
+        item_keys: List of Zotero item keys.
+        target_folder: Absolute path to target folder.
+        ctx: MCP context.
+    """
+    import os, shutil
+    from zotmcp.utils import get_zotero_base_attachment_path
+
+    ctx.info(f"Exporting PDFs for {len(item_keys)} items to {target_folder}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    os.makedirs(target_folder, exist_ok=True)
+    linked_base = get_zotero_base_attachment_path()
+
+    copied = []
+    missing = []
+    errors = []
+
+    for key in item_keys:
+        children = await client.get_item_children(key)
+        pdf_found = False
+        for child in children:
+            raw = (child.raw_data or {}).get("data", {})
+            content_type = raw.get("contentType", "")
+            if "pdf" not in content_type.lower() and "pdf" not in (child.title or "").lower():
+                continue
+
+            path = raw.get("path", "")
+            if not path:
+                continue
+
+            # Resolve attachments: prefix
+            if path.startswith("attachments:") and linked_base:
+                rel = path.replace("attachments:", "", 1)
+                full_path = os.path.join(linked_base, rel)
+            elif os.path.isabs(path):
+                full_path = path
+            else:
+                continue
+
+            if os.path.exists(full_path):
+                # Copy with safe filename
+                item = await client.get_item(key)
+                safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in (item.title if item else key)[:60])
+                dest = os.path.join(target_folder, f"{safe_name}.pdf")
+                # Avoid overwrite
+                if os.path.exists(dest):
+                    dest = os.path.join(target_folder, f"{safe_name}_{key}.pdf")
+                shutil.copy2(full_path, dest)
+                copied.append(f"`{key}`: {os.path.basename(dest)}")
+                pdf_found = True
+                break
+            else:
+                errors.append(f"`{key}`: path not found: {full_path}")
+                pdf_found = True
+                break
+
+        if not pdf_found:
+            missing.append(f"`{key}`")
+
+    lines = [f"## PDF Export Summary\n"]
+    lines.append(f"**Copied:** {len(copied)}/{len(item_keys)}")
+    if copied:
+        lines.append("\n".join(f"  - {c}" for c in copied))
+    if missing:
+        lines.append(f"\n**No PDF attachment:** {len(missing)}")
+        lines.append("\n".join(f"  - {m}" for m in missing))
+    if errors:
+        lines.append(f"\n**Errors:** {len(errors)}")
+        lines.append("\n".join(f"  - {e}" for e in errors))
+    lines.append(f"\nTarget: `{target_folder}`")
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Attachment Path Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_get_attachment_path",
+    description="Get the full filesystem path for a Zotero item's PDF attachment. Resolves linked and stored attachment paths.",
+)
+async def get_attachment_path(
+    item_key: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Get attachment path for an item.
+
+    Args:
+        item_key: Zotero item key (parent item or attachment key).
+        ctx: MCP context.
+    """
+    import os
+    from zotmcp.utils import get_zotero_base_attachment_path
+
+    ctx.info(f"Getting attachment path for {item_key}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    linked_base = get_zotero_base_attachment_path()
+
+    # Check if key is itself an attachment
+    item = await client.get_item(item_key)
+    if not item:
+        return f"Item `{item_key}` not found."
+
+    raw = (item.raw_data or {}).get("data", {})
+
+    # If this is an attachment item, get its path directly
+    if raw.get("itemType") == "attachment":
+        children_to_check = [item]
+    else:
+        children_to_check = await client.get_item_children(item_key)
+
+    results = []
+    for child in children_to_check:
+        child_raw = (child.raw_data or {}).get("data", {})
+        content_type = child_raw.get("contentType", "")
+        path = child_raw.get("path", "")
+        link_mode = child_raw.get("linkMode", "")
+        title = child.title or "untitled"
+
+        if not path:
+            continue
+
+        # Resolve path
+        if path.startswith("attachments:") and linked_base:
+            rel = path.replace("attachments:", "", 1)
+            full_path = os.path.join(linked_base, rel)
+            zotero_path = path
+        elif os.path.isabs(path):
+            full_path = path
+            zotero_path = path
+        else:
+            full_path = path
+            zotero_path = path
+
+        exists = os.path.exists(full_path)
+        size = ""
+        if exists:
+            size_bytes = os.path.getsize(full_path)
+            size = f" ({size_bytes // 1024} KB)"
+
+        results.append(
+            f"- **{title}** ({content_type}, {link_mode})\n"
+            f"  Zotero path: `{zotero_path}`\n"
+            f"  Full path: `{full_path}`\n"
+            f"  Exists: {'yes' + size if exists else 'NO'}"
+        )
+
+    if not results:
+        return f"No attachments found for `{item_key}`."
+
+    return f"## Attachments for `{item_key}`\n\n" + "\n".join(results)
+
+
+# =============================================================================
+# Collection Export Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_export_collection",
+    description="Export all PDFs in a collection to a target folder with an index file.",
+)
+async def export_collection(
+    collection_key: str,
+    target_folder: str,
+    flatten: bool = True,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Export all PDFs in a collection.
+
+    Args:
+        collection_key: Zotero collection key.
+        target_folder: Target folder path.
+        flatten: If True, all PDFs in one folder. If False, per-item subfolders.
+        ctx: MCP context.
+    """
+    import os, shutil
+    from zotmcp.utils import get_zotero_base_attachment_path
+
+    ctx.info(f"Exporting collection {collection_key} to {target_folder}")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    items = await client.get_collection_items(collection_key, limit=500)
+    if not items:
+        return f"Collection `{collection_key}` is empty or not found."
+
+    os.makedirs(target_folder, exist_ok=True)
+    linked_base = get_zotero_base_attachment_path()
+
+    copied = 0
+    no_pdf = 0
+    index_lines = ["# Collection Export Index\n"]
+
+    for item in items:
+        children = await client.get_item_children(item.key)
+        pdf_path = None
+
+        for child in children:
+            child_raw = (child.raw_data or {}).get("data", {})
+            if "pdf" not in child_raw.get("contentType", "").lower():
+                continue
+            path = child_raw.get("path", "")
+            if path.startswith("attachments:") and linked_base:
+                full = os.path.join(linked_base, path.replace("attachments:", "", 1))
+            elif os.path.isabs(path):
+                full = path
+            else:
+                continue
+            if os.path.exists(full):
+                pdf_path = full
+                break
+
+        safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in item.title[:60])
+
+        if pdf_path:
+            if flatten:
+                dest = os.path.join(target_folder, f"{safe_name}.pdf")
+                if os.path.exists(dest):
+                    dest = os.path.join(target_folder, f"{safe_name}_{item.key}.pdf")
+            else:
+                item_dir = os.path.join(target_folder, safe_name)
+                os.makedirs(item_dir, exist_ok=True)
+                dest = os.path.join(item_dir, os.path.basename(pdf_path))
+
+            shutil.copy2(pdf_path, dest)
+            copied += 1
+            index_lines.append(f"- [{item.title[:80]}]({os.path.basename(dest)}) — `{item.key}`")
+        else:
+            no_pdf += 1
+            index_lines.append(f"- {item.title[:80]} — `{item.key}` (no PDF)")
+
+    # Write index
+    index_path = os.path.join(target_folder, "INDEX.md")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(index_lines))
+
+    return f"Exported {copied}/{len(items)} PDFs to `{target_folder}` ({no_pdf} without PDF).\nIndex: `{index_path}`"
+
+
+# =============================================================================
+# Tag Rename Tool
+# =============================================================================
+
+
+@mcp.tool(
+    name="zotero_rename_tag",
+    description="Rename a tag across all items that use it. Adds the new tag and removes the old one.",
+)
+async def rename_tag(
+    old_tag: str,
+    new_tag: str,
+    *,
+    ctx: Context,
+) -> str:
+    """
+    Rename a tag library-wide.
+
+    Args:
+        old_tag: Current tag name.
+        new_tag: New tag name.
+        ctx: MCP context.
+    """
+    ctx.info(f"Renaming tag '{old_tag}' -> '{new_tag}'")
+    client = get_client()
+
+    if not await client.is_available():
+        return "Error: Zotero is not available."
+
+    # Search for items with the old tag
+    items = await client.search_items("", limit=500, tags=[old_tag])
+    if not items:
+        return f"No items found with tag '{old_tag}'."
+
+    updated = 0
+    failed = 0
+    for item in items:
+        success = await client.update_item_tags(item.key, add_tags=[new_tag], remove_tags=[old_tag])
+        if success:
+            updated += 1
+        else:
+            failed += 1
+
+    result = f"Renamed tag '{old_tag}' -> '{new_tag}' on {updated} items."
+    if failed:
+        result += f" ({failed} failed)"
+    return result
+
 
 
 def create_server() -> FastMCP:

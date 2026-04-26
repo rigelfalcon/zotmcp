@@ -10,11 +10,19 @@ A professional Zotero MCP (Model Context Protocol) server with remote access, re
   - Zotero Web API (pyzotero)
   - Direct SQLite database access (read-only)
 
-- **14 Tools** (12 core + 2 semantic)
-  - Search: keyword search, semantic search, collections, tags
-  - Read: metadata, full text, annotations
-  - Write: create notes, update tags
-  - Organize: move to collections, batch tag updates
+- **63 Tools** across 13 categories
+  - Search: keyword, semantic, citation key, saved searches, find similar
+  - Read: metadata (markdown/json/bibtex), full text, annotations, PDF outline
+  - Import: DOI, PMID, URL (auto-DOI detection), file; preprint support (arXiv/bioRxiv)
+  - Write: update item fields, create/update notes, manage tags
+  - Organize: collections CRUD, move/remove items, batch operations
+  - PDF: fetch (Unpaywall/Sci-Hub/arXiv direct, linked files), find, copy, base64
+  - Export: batch BibTeX, CSL citation rendering (APA/Nature/IEEE/etc.)
+  - Metrics: iCite citation stats, preprint publication check, collection/library stats
+  - Duplicates: find, merge, find duplicate PDFs
+  - Trash: list, trash, restore
+  - DOCX: scan and render citation placeholders
+  - Sync: trigger library sync
 
 ### Key Features
 
@@ -225,31 +233,131 @@ Then include in requests:
 curl -H "Authorization: Bearer your-secret-token" http://192.168.x.x:8765/tools
 ```
 
-## Available Tools
+## Available Tools (59 total)
 
-### Core Tools (Always Available)
+### Search & Discovery
 
 | Tool | Description |
 |------|-------------|
-| `zotero_search` | Search items by keywords |
+| `zotero_search` | Keyword search across library |
+| `zotero_semantic_search` | AI-powered semantic search (requires `[semantic]`) |
+| `zotero_find_similar` | Find items similar to a given item |
+| `zotero_search_by_citation_key` | Search by BetterBibTeX citation key |
+| `zotero_search_notes` | Search note content |
 | `zotero_get_recent` | Get recently added items |
-| `zotero_get_item` | Get item metadata (markdown/json/bibtex) |
-| `zotero_get_fulltext` | Get full text content |
+| `zotero_list_saved_searches` | List saved Zotero searches |
+| `zotero_run_saved_search` | Run a saved search |
+
+### Item Management
+
+| Tool | Description |
+|------|-------------|
+| `zotero_get_item` | Get metadata (markdown/json/bibtex) |
+| `zotero_get_fulltext` | Get full text content (PDF extraction) |
+| `zotero_get_item_children` | Get attachments and notes |
+| `zotero_update_item` | Update item fields (title, type, date, etc.) |
+| `zotero_trash_item` | Move item to trash |
+| `zotero_restore_from_trash` | Restore item from trash |
+| `zotero_list_trash` | List trashed items |
+
+### Import
+
+| Tool | Description |
+|------|-------------|
+| `zotero_add_by_doi` | Add by DOI (CrossRef + bioRxiv/arXiv fallback) |
+| `zotero_add_by_pmid` | Add by PubMed ID |
+| `zotero_add_by_url` | Add by URL (auto-detects DOI URLs) |
+| `zotero_add_from_file` | Add from local PDF file |
+
+### PDF
+
+| Tool | Description |
+|------|-------------|
+| `zotero_fetch_pdf` | Download PDF (Unpaywall/Sci-Hub/arXiv/bioRxiv) as linked file |
+| `zotero_find_pdf` | Find PDF on disk (Everything search) |
+| `zotero_copy_pdf` | Copy PDF to target directory |
+| `zotero_batch_copy_pdfs` | Batch copy PDFs |
+| `zotero_get_pdf_base64` | Get PDF as base64 |
+| `zotero_batch_get_pdfs_base64` | Batch get PDFs as base64 |
+| `zotero_list_pdfs` | List PDF metadata |
+| `zotero_get_pdf_outline` | Get PDF table of contents |
+| `zotero_find_duplicate_pdfs` | Find duplicate PDFs by hash |
+| `zotero_export_pdfs` | Export PDFs for item list to folder |
+| `zotero_get_attachment_path` | Get full filesystem path for attachments |
+| `zotero_export_collection` | Export all PDFs in a collection with index |
+
+### Collections
+
+| Tool | Description |
+|------|-------------|
 | `zotero_get_collections` | List all collections |
 | `zotero_get_collection_items` | Get items in collection |
+| `zotero_create_collection` | Create collection |
+| `zotero_delete_collection` | Delete collection |
+| `zotero_rename_collection` | Rename collection |
+| `zotero_move_to_collection` | Move item to collection |
+| `zotero_batch_move_to_collection` | Batch move items |
+| `zotero_remove_from_collection` | Remove item (no delete) |
+| `zotero_collection_stats` | Collection stats (PDF coverage, year/journal dist.) |
+
+### Tags & Notes
+
+| Tool | Description |
+|------|-------------|
 | `zotero_get_tags` | List all tags |
 | `zotero_update_tags` | Add/remove tags |
 | `zotero_batch_tags` | Batch update tags |
-| `zotero_create_note` | Create a note |
-| `zotero_move_to_collection` | Move item to collection |
-| `zotero_status` | Check connection status |
+| `zotero_rename_tag` | Rename tag across all items |
+| `zotero_create_note` | Create note |
+| `zotero_get_notes` | Get notes |
+| `zotero_update_note` | Update note |
+| `zotero_delete_note` | Delete note |
 
-### Semantic Tools (Require `[semantic]` install)
+### Annotations
 
 | Tool | Description |
 |------|-------------|
-| `zotero_semantic_search` | AI-powered semantic similarity search |
-| `zotero_update_embeddings` | Update/rebuild semantic index |
+| `zotero_get_annotations` | Get PDF annotations |
+| `zotero_create_annotation` | Create text highlight |
+| `zotero_create_area_annotation` | Create area annotation |
+
+### Export & Citation
+
+| Tool | Description |
+|------|-------------|
+| `zotero_batch_export_bibtex` | Export items as BibTeX |
+| `zotero_cite` | Render formatted citation (APA/Nature/IEEE/etc.) |
+
+### Metrics & Status
+
+| Tool | Description |
+|------|-------------|
+| `zotero_item_metrics` | NIH iCite citation metrics |
+| `zotero_check_preprint_published` | Check if preprint is published |
+| `zotero_library_stats` | Library-wide statistics |
+| `zotero_status` | Connection status |
+| `zotero_sync` | Trigger library sync |
+
+### Duplicates
+
+| Tool | Description |
+|------|-------------|
+| `zotero_find_duplicates` | Find duplicate items |
+| `zotero_merge_duplicates` | Merge duplicates (dry-run default) |
+
+### Semantic Search (requires `[semantic]`)
+
+| Tool | Description |
+|------|-------------|
+| `zotero_semantic_search` | Semantic similarity search |
+| `zotero_update_embeddings` | Update search index |
+
+### DOCX Citation Workflow
+
+| Tool | Description |
+|------|-------------|
+| `zotero_docx_scan_citations` | Scan DOCX for citation markers |
+| `zotero_docx_render_citations` | Render citation placeholders |
 
 ## CLI Commands
 

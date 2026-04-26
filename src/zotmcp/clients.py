@@ -195,6 +195,11 @@ class ZoteroClientBase(ABC):
         pass
 
     @abstractmethod
+    async def update_item(self, key: str, fields: dict) -> bool:
+        """Update item fields (title, itemType, date, etc.). Returns True on success."""
+        pass
+
+    @abstractmethod
     async def trash_item(self, key: str) -> bool:
         """Move item to trash."""
         pass
@@ -609,6 +614,11 @@ class ZoteroLocalClient(ZoteroClientBase):
         )
         return result is not None
 
+    async def update_item(self, key: str, fields: dict) -> bool:
+        """Update item via local API (limited, prefer Web API)."""
+        logger.warning("LocalAPIClient update_item not fully supported, use Web/Hybrid client")
+        return False
+
     async def trash_item(self, key: str) -> bool:
         """Move item to trash via local API."""
         item = await self.get_item(key)
@@ -1003,20 +1013,64 @@ class ZoteroWebClient(ZoteroClientBase):
             logger.error(f"Failed to update note: {e}")
             return False
 
-    async def trash_item(self, key: str) -> bool:
-        """Trash item via pyzotero."""
+    async def update_item(self, key: str, fields: dict) -> bool:
+        """Update item fields via pyzotero. Validates fields before sending."""
+        PROTECTED_FIELDS = {"key", "version", "dateAdded", "dateModified", "relations", "parentItem"}
+
+        if not isinstance(fields, dict) or not fields:
+            logger.error("update_item: fields must be a non-empty dict")
+            return False
+
+        # Reject protected fields
+        bad_fields = PROTECTED_FIELDS & set(fields.keys())
+        if bad_fields:
+            logger.error(f"update_item: cannot modify protected fields: {bad_fields}")
+            return False
+
         zot = self._get_zot()
         loop = asyncio.get_event_loop()
 
-        def _trash():
+        def _update():
             item = zot.item(key)
             if not item:
                 return False
-            zot.trash_item(item)
+            for field, value in fields.items():
+                item["data"][field] = value
+            zot.update_item(item)
             return True
 
         try:
-            return await loop.run_in_executor(None, _trash)
+            return await loop.run_in_executor(None, _update)
+        except Exception as e:
+            logger.error(f"Failed to update item {key}: {e}")
+            return False
+
+    async def trash_item(self, key: str) -> bool:
+        """Trash item via Zotero Web API (raw PATCH, pyzotero lacks trash support)."""
+        zot = self._get_zot()
+        loop = asyncio.get_event_loop()
+
+        def _get_version():
+            item = zot.item(key)
+            return item.get("version") or item.get("data", {}).get("version") if item else None
+
+        try:
+            version = await loop.run_in_executor(None, _get_version)
+            if not version:
+                logger.error(f"Item {key} not found or has no version")
+                return False
+
+            import httpx
+            url = f"https://api.zotero.org/users/{zot.library_id}/items/{key}"
+            headers = {
+                "Zotero-API-Key": zot.api_key,
+                "If-Unmodified-Since-Version": str(version),
+                "Content-Type": "application/json",
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.patch(url, json={"deleted": 1}, headers=headers)
+                resp.raise_for_status()
+            return True
         except Exception as e:
             logger.error(f"Failed to trash item: {e}")
             return False
@@ -1336,6 +1390,10 @@ class ZoteroSQLiteClient(ZoteroClientBase):
         logger.warning("SQLite client is read-only, cannot update notes")
         return False
 
+    async def update_item(self, key: str, fields: dict) -> bool:
+        logger.warning("SQLite client is read-only, cannot update items")
+        return False
+
     async def trash_item(self, key: str) -> bool:
         logger.warning("SQLite client is read-only, cannot trash items")
         return False
@@ -1451,21 +1509,21 @@ class ZoteroHybridClient(ZoteroClientBase):
         self, key: str, add_tags: list[str] = None, remove_tags: list[str] = None
     ) -> bool:
         """Update item tags via Local API."""
-        return await self._local_client.update_item_tags(key, add_tags, remove_tags)
+        return await self._web_client.update_item_tags(key, add_tags, remove_tags)
 
     async def create_note(
         self, parent_key: str, content: str, tags: list[str] = None
     ) -> Optional[str]:
         """Create note via Local API."""
-        return await self._local_client.create_note(parent_key, content, tags)
+        return await self._web_client.create_note(parent_key, content, tags)
 
     async def move_item_to_collection(self, item_key: str, collection_key: str) -> bool:
         """Move item to collection via Local API."""
-        return await self._local_client.move_item_to_collection(item_key, collection_key)
+        return await self._web_client.move_item_to_collection(item_key, collection_key)
 
     async def batch_move_to_collection(self, item_keys: list[str], collection_key: str) -> dict[str, bool]:
         """Batch move items via Local API."""
-        return await self._local_client.batch_move_to_collection(item_keys, collection_key)
+        return await self._web_client.batch_move_to_collection(item_keys, collection_key)
 
     # Collection CRUD - use Web API (only way to modify collections)
     async def create_collection(self, name: str, parent_key: Optional[str] = None) -> Optional[str]:
@@ -1491,19 +1549,23 @@ class ZoteroHybridClient(ZoteroClientBase):
 
     async def update_note(self, note_key: str, content: str, append: bool = True) -> bool:
         """Update note via Local API."""
-        return await self._local_client.update_note(note_key, content, append)
+        return await self._web_client.update_note(note_key, content, append)
+
+    async def update_item(self, key: str, fields: dict) -> bool:
+        """Update item via Web API."""
+        return await self._web_client.update_item(key, fields)
 
     async def trash_item(self, key: str) -> bool:
-        """Trash item via Local API."""
-        return await self._local_client.trash_item(key)
+        """Trash item via Web API."""
+        return await self._web_client.trash_item(key)
 
     async def download_attachment(self, key: str) -> Optional[bytes]:
         """Download attachment via Local API."""
         return await self._local_client.download_attachment(key)
 
     async def create_item_raw(self, item_data: dict) -> Optional[str]:
-        """Create item via Local API."""
-        return await self._local_client.create_item_raw(item_data)
+        """Create item via Web API."""
+        return await self._web_client.create_item_raw(item_data)
 
     async def get_all_items(
         self, limit: int = 50, item_type: Optional[str] = None
