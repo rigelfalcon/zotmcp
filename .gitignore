@@ -107,3 +107,7 @@ test_new_features.py
 *.spec
 pip-log.txt
 pip-delete-this-directory.txt
+  
+# ©¤©¤ Temporary output files ©¤©¤  
+*.err  
+*.out 
