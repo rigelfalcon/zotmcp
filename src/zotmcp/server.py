@@ -62,6 +62,11 @@ def get_semantic_engine() -> Optional["SemanticEngine"]:
                 return None
     return _semantic_engine
 
+async def ensure_semantic_engine_initialized(engine: "SemanticEngine") -> None:
+    """Initialize semantic search on demand if server lifespan did not run it."""
+    if getattr(engine, "initialized", False) or getattr(engine, "_initialized", False):
+        return
+    await engine.initialize()
 
 def format_item_markdown(item: ZoteroItem, include_abstract: bool = True) -> str:
     """Format a Zotero item as markdown."""
@@ -108,7 +113,7 @@ async def server_lifespan(server: FastMCP):
     semantic_engine = get_semantic_engine()
     if semantic_engine:
         try:
-            await semantic_engine.initialize()
+            await ensure_semantic_engine_initialized(semantic_engine)
             sys.stderr.write("Semantic search engine initialized.\n")
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to initialize semantic engine: {e}\n")
@@ -796,6 +801,10 @@ async def semantic_search(
     engine = get_semantic_engine()
     if not engine:
         return "Semantic search not available. Enable in config or install dependencies (chromadb, sentence-transformers)."
+    try:
+        await ensure_semantic_engine_initialized(engine)
+    except Exception as e:
+        return f"Semantic search initialization failed: {e}"
 
     # Apply metadata filter if item_type specified
     filter_metadata = {"item_type": item_type} if item_type else None
@@ -846,6 +855,10 @@ async def update_embeddings(
     engine = get_semantic_engine()
     if not engine:
         return "Semantic search not available."
+    try:
+        await ensure_semantic_engine_initialized(engine)
+    except Exception as e:
+        return f"Semantic search initialization failed: {e}"
 
     client = get_client()
 
@@ -2450,29 +2463,36 @@ async def search_by_citation_key(
 
 @mcp.tool(
     name="zotero_find_duplicate_pdfs",
-    description="Find duplicate PDF attachments by SHA-256 content hash. Reads directly from Zotero storage directory for speed.",
+    description="Find duplicate PDF attachments by SHA-256 content hash across stored and linked files.",
 )
 async def find_duplicate_pdfs(
     limit: int = 500,
     collection_key: Optional[str] = None,
     storage_path: Optional[str] = None,
+    linked_base_path: Optional[str] = None,
+    include_missing: bool = False,
     *,
     ctx: Context,
 ) -> str:
     """
     Find duplicate PDFs by file content hash.
 
-    Scans Zotero's storage directory to compute SHA-256 hashes of all PDFs,
-    then groups identical files. Much faster than downloading via API.
+    Resolves both Zotero stored PDFs and linked PDFs, computes SHA-256 for
+    files with matching sizes, then separates database link duplicates from
+    duplicate physical files.
 
     Args:
         limit: Maximum number of parent items to scan.
         collection_key: Limit to a specific collection.
         storage_path: Override Zotero storage path (auto-detected if not set).
+        linked_base_path: Override Zotero linked attachment base path.
+        include_missing: Include missing PDF attachment details in output.
         ctx: MCP context.
     """
     import hashlib
-    from pathlib import Path
+    from collections import Counter
+
+    from zotmcp.utils import get_zotero_base_attachment_path
 
     ctx.info(f"Scanning for duplicate PDFs (limit={limit})")
     client = get_client()
@@ -2480,9 +2500,56 @@ async def find_duplicate_pdfs(
     if not await client.is_available():
         return "Error: Zotero is not available."
 
-    # Auto-detect storage path
+    def _human_size(size: int) -> str:
+        return f"{size/1024/1024:.1f} MB" if size > 1024 * 1024 else f"{size/1024:.0f} KB"
+
+    def _file_sha256(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _norm_path(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    def _expand_path(path: str) -> Path:
+        return Path(os.path.expanduser(os.path.expandvars(path)))
+
+    def _find_stored_pdf(att_key: str, filename: str) -> Optional[Path]:
+        if not storage_dir:
+            return None
+        key_dir = storage_dir / att_key
+        if not key_dir.is_dir():
+            return None
+        if filename:
+            candidate = key_dir / filename
+            if candidate.is_file():
+                return candidate
+        for f in key_dir.iterdir():
+            if f.suffix.lower() == ".pdf" and f.is_file():
+                return f
+        return None
+
+    def _resolve_linked_pdf(raw_path: str) -> Optional[Path]:
+        if not raw_path:
+            return None
+        path = raw_path
+        if path.startswith("attachments:"):
+            if not linked_base:
+                return None
+            rel_path = path[len("attachments:"):].lstrip("/\\")
+            return linked_base / rel_path
+        candidate = _expand_path(path)
+        if candidate.is_absolute():
+            return candidate
+        if linked_base:
+            return linked_base / path
+        return candidate
+
+    # Auto-detect paths.
+    storage_dir: Optional[Path] = None
     if not storage_path:
-        # Common Zotero data directories on Windows
         candidates = [
             Path(r"D:/Zotero/ZoteroDB/storage"),
             Path(os.path.expandvars(r"%USERPROFILE%/Zotero/storage")),
@@ -2492,12 +2559,18 @@ async def find_duplicate_pdfs(
             if p.is_dir():
                 storage_path = str(p)
                 break
+    if storage_path:
+        storage_candidate = _expand_path(storage_path)
+        if storage_candidate.is_dir():
+            storage_dir = storage_candidate
 
-    if not storage_path or not Path(storage_path).is_dir():
-        return "Error: Zotero storage directory not found. Set storage_path parameter."
+    linked_base: Optional[Path] = None
+    linked_base_value = linked_base_path or get_zotero_base_attachment_path()
+    if linked_base_value:
+        linked_base = _expand_path(linked_base_value)
 
-    storage_dir = Path(storage_path)
-    ctx.info(f"Using storage: {storage_dir}")
+    ctx.info(f"Using storage: {storage_dir or 'not found'}")
+    ctx.info(f"Using linked base: {linked_base or 'not found'}")
 
     # Get items to map keys to metadata
     if collection_key:
@@ -2505,51 +2578,90 @@ async def find_duplicate_pdfs(
     else:
         items = await client.get_all_items(limit=limit)
 
-    # Build parent lookup: attachment_key -> parent info
-    att_to_parent = {}
+    # Build attachment records with resolved disk paths.
+    attachments = {}
+    link_modes = Counter()
     for item in items:
         children = await client.get_item_children(item.key)
         for child in children:
             raw = child.raw_data or {}
             data = raw.get("data", {})
             ct = data.get("contentType", "")
+            filename = data.get("filename") or child.title or ""
             if ct == "application/pdf" or (
                 child.item_type == "attachment"
-                and (child.title.lower().endswith(".pdf") or data.get("filename", "").lower().endswith(".pdf"))
+                and ((child.title or "").lower().endswith(".pdf") or filename.lower().endswith(".pdf"))
             ):
-                att_to_parent[child.key] = {
-                    "att_key": child.key,
-                    "att_title": child.title,
-                    "filename": data.get("filename", child.title),
-                    "parent_key": item.key,
-                    "parent_title": item.title,
-                    "parent_type": item.item_type,
-                    "parent_creators": item.format_creators()[:60],
+                link_mode = data.get("linkMode", "unknown")
+                raw_path = data.get("path", "")
+                link_modes[link_mode] += 1
+                resolved_path = None
+                if link_mode == "linked_file":
+                    resolved_path = _resolve_linked_pdf(raw_path)
+                elif link_mode == "imported_file":
+                    resolved_path = _find_stored_pdf(child.key, filename)
+                else:
+                    stored = _find_stored_pdf(child.key, filename)
+                    resolved_path = stored or _resolve_linked_pdf(raw_path)
+
+                exists = bool(resolved_path and resolved_path.is_file())
+                size = resolved_path.stat().st_size if exists and resolved_path else None
+                attachments[child.key] = {
+                    "attachmentKey": child.key,
+                    "filename": filename,
+                    "attachmentTitle": child.title,
+                    "linkMode": link_mode,
+                    "zoteroPath": raw_path,
+                    "resolvedPath": str(resolved_path) if resolved_path else "",
+                    "pathKey": _norm_path(resolved_path) if exists and resolved_path else "",
+                    "exists": exists,
+                    "size": size,
+                    "parentKey": item.key,
+                    "parentTitle": item.title,
+                    "parentType": item.item_type,
+                    "parentCreators": item.format_creators()[:60],
                 }
 
-    ctx.info(f"Found {len(att_to_parent)} PDF attachments across {len(items)} items")
+    ctx.info(f"Found {len(attachments)} PDF attachments across {len(items)} items")
 
-    if len(att_to_parent) < 2:
-        return f"Found {len(att_to_parent)} PDF(s). Need at least 2 to check."
+    if len(attachments) < 2:
+        return f"Found {len(attachments)} PDF(s). Need at least 2 to check."
 
-    # Phase 1: Scan storage directory, compute file sizes
-    file_info = {}  # key -> {path, size}
-    for att_key in att_to_parent:
-        key_dir = storage_dir / att_key
-        if key_dir.is_dir():
-            for f in key_dir.iterdir():
-                if f.suffix.lower() == ".pdf" and f.is_file():
-                    file_info[att_key] = {"path": f, "size": f.stat().st_size}
-                    break
+    existing = {k: v for k, v in attachments.items() if v["exists"]}
+    missing = [v for v in attachments.values() if not v["exists"]]
 
-    ctx.info(f"Found {len(file_info)} PDFs on disk")
+    ctx.info(f"Resolved {len(existing)} PDFs on disk; missing {len(missing)}")
 
-    # Phase 2: Group by file size (quick pre-filter)
+    # Same physical path means database/link duplication, not duplicate disk usage.
+    path_groups = {}
+    for key, info in existing.items():
+        path_groups.setdefault(info["pathKey"], []).append(key)
+    same_path_groups = [
+        {
+            "path": existing[keys[0]]["resolvedPath"],
+            "count": len(keys),
+            "fileSize": _human_size(existing[keys[0]]["size"]),
+            "attachments": [
+                {
+                    "attachmentKey": k,
+                    "linkMode": existing[k]["linkMode"],
+                    "parentKey": existing[k]["parentKey"],
+                    "parentTitle": existing[k]["parentTitle"][:80],
+                    "parentCreators": existing[k]["parentCreators"],
+                }
+                for k in keys
+            ],
+        }
+        for keys in path_groups.values()
+        if len(keys) >= 2
+    ]
+
+    # Phase 1: Group by file size (quick pre-filter).
     size_groups = {}
-    for key, info in file_info.items():
+    for key, info in existing.items():
         size_groups.setdefault(info["size"], []).append(key)
 
-    # Only hash files that share a size with at least one other
+    # Only hash files that share a size with at least one other attachment.
     to_hash = set()
     for size, keys in size_groups.items():
         if len(keys) >= 2:
@@ -2557,57 +2669,83 @@ async def find_duplicate_pdfs(
 
     ctx.info(f"Hashing {len(to_hash)} PDFs with matching sizes...")
 
-    # Phase 3: Compute SHA-256 for candidates
+    # Phase 2: Compute SHA-256 for candidates.
     hash_groups = {}
     for key in to_hash:
-        path = file_info[key]["path"]
+        path = Path(existing[key]["resolvedPath"])
         try:
-            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            sha = _file_sha256(path)
             hash_groups.setdefault(sha, []).append(key)
-        except Exception:
-            pass
+        except Exception as e:
+            existing[key]["hashError"] = str(e)
 
-    # Collect duplicate groups
+    # Collect content duplicate groups. Disk waste counts unique physical paths,
+    # so two Zotero attachments pointing at one linked file waste 0 bytes.
     dup_groups = []
     total_wasted = 0
     for sha, keys in hash_groups.items():
         if len(keys) >= 2:
+            unique_paths = sorted({existing[k]["pathKey"] for k in keys})
             files = []
             for k in keys:
-                info = att_to_parent.get(k, {})
-                size = file_info[k]["size"]
+                info = existing[k]
+                size = info["size"]
                 files.append({
                     "attachmentKey": k,
-                    "filename": info.get("filename", "?"),
+                    "filename": info["filename"],
+                    "linkMode": info["linkMode"],
+                    "zoteroPath": info["zoteroPath"],
+                    "resolvedPath": info["resolvedPath"],
                     "size": size,
-                    "sizeHuman": f"{size/1024/1024:.1f} MB" if size > 1024*1024 else f"{size/1024:.0f} KB",
-                    "parentKey": info.get("parent_key", "?"),
-                    "parentTitle": info.get("parent_title", "?")[:80],
-                    "parentType": info.get("parent_type", "?"),
-                    "parentCreators": info.get("parent_creators", ""),
+                    "sizeHuman": _human_size(size),
+                    "parentKey": info["parentKey"],
+                    "parentTitle": info["parentTitle"][:80],
+                    "parentType": info["parentType"],
+                    "parentCreators": info["parentCreators"],
                 })
-            wasted = file_info[keys[0]]["size"] * (len(keys) - 1)
+            wasted = existing[keys[0]]["size"] * (len(unique_paths) - 1)
             total_wasted += wasted
             dup_groups.append({
                 "sha256": sha[:16] + "...",
                 "count": len(keys),
+                "uniquePhysicalFiles": len(unique_paths),
+                "duplicateType": "same_path" if len(unique_paths) == 1 else "same_hash_different_path",
                 "fileSize": files[0]["sizeHuman"],
-                "wastedSpace": f"{wasted/1024/1024:.1f} MB" if wasted > 1024*1024 else f"{wasted/1024:.0f} KB",
+                "wastedSpace": _human_size(wasted),
                 "files": files,
             })
 
-    dup_groups.sort(key=lambda g: -g["count"])
+    dup_groups.sort(key=lambda g: (-g["uniquePhysicalFiles"], -g["count"]))
 
     result = {
-        "storagePath": str(storage_dir),
+        "storagePath": str(storage_dir) if storage_dir else None,
+        "linkedBasePath": str(linked_base) if linked_base else None,
         "totalItems": len(items),
-        "totalPDFs": len(att_to_parent),
-        "pdfsOnDisk": len(file_info),
+        "totalPDFs": len(attachments),
+        "linkModes": dict(link_modes),
+        "pdfsOnDisk": len(existing),
+        "missingPDFs": len(missing),
         "candidatesHashed": len(to_hash),
         "duplicateGroups": len(dup_groups),
-        "totalWastedSpace": f"{total_wasted/1024/1024:.1f} MB",
+        "samePathGroups": len(same_path_groups),
+        "totalWastedSpace": _human_size(total_wasted),
     }
 
+    if same_path_groups:
+        result["samePathDetails"] = same_path_groups
+    if include_missing and missing:
+        result["missingDetails"] = [
+            {
+                "attachmentKey": m["attachmentKey"],
+                "filename": m["filename"],
+                "linkMode": m["linkMode"],
+                "zoteroPath": m["zoteroPath"],
+                "resolvedPath": m["resolvedPath"],
+                "parentKey": m["parentKey"],
+                "parentTitle": m["parentTitle"][:80],
+            }
+            for m in missing
+        ]
     if not dup_groups:
         result["message"] = "No duplicate PDFs found."
     else:

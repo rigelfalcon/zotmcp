@@ -198,7 +198,7 @@ class SemanticEngine:
             texts = []
             for item in batch:
                 # Combine title and abstract for better semantic representation
-                text_parts = [item.get("title", "")]
+                text_parts = [item.get("title") or ""]
                 if item.get("abstract"):
                     text_parts.append(item["abstract"])
                 texts.append(" ".join(text_parts))
@@ -212,10 +212,10 @@ class SemanticEngine:
             ids = [item["key"] for item in batch]
             metadatas = [
                 {
-                    "title": item.get("title", "Untitled"),
-                    "item_type": item.get("item_type", ""),
-                    "date": item.get("date", ""),
-                    "creators": str(item.get("creators", [])),
+                    "title": item.get("title") or "Untitled",
+                    "item_type": item.get("item_type") or "",
+                    "date": item.get("date") or "",
+                    "creators": str(item.get("creators") or []),
                 }
                 for item in batch
             ]
