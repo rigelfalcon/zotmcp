@@ -250,7 +250,7 @@ class ZoteroLocalClient(ZoteroClientBase):
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), limits=httpx.Limits(max_connections=5, max_keepalive_connections=2))
         return self._client
 
     async def _request(
@@ -1635,3 +1635,4 @@ def create_client(config) -> ZoteroClientBase:
         )
     else:
         raise ValueError(f"Unknown mode: {config.mode}")
+
