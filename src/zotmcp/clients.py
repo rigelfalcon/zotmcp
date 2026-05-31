@@ -14,6 +14,7 @@ import os
 from zotmcp.utils import get_zotero_base_attachment_path, strip_html
 
 import httpx
+from zotmcp.cache import ResponseCache
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,8 @@ class ZoteroLocalClient(ZoteroClientBase):
         self._search_groups = search_groups
         # Cache for groups
         self._groups_cache: Optional[list[ZoteroGroup]] = None
+        # Response cache for GET requests
+        self._cache = ResponseCache(default_ttl=300, max_entries=500)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -253,16 +256,38 @@ class ZoteroLocalClient(ZoteroClientBase):
     async def _request(
         self, method: str, endpoint: str, **kwargs
     ) -> Optional[dict | list]:
-        """Make a request to the local API."""
+        """Make a request to the local API (with caching for GET)."""
+        # Only cache GET requests
+        if method.upper() == "GET":
+            params = kwargs.get("params")
+            cached = self._cache.get(method, endpoint, params)
+            if cached is not None:
+                return cached
+
         client = await self._get_client()
         url = f"{self.base_url}{endpoint}"
         try:
             response = await client.request(method, url, **kwargs)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+
+            # Cache successful GET responses
+            if method.upper() == "GET" and result is not None:
+                params = kwargs.get("params")
+                self._cache.set(method, endpoint, result, params=params)
+            elif method.upper() != "GET":
+                # Write operations invalidate cache
+                self._cache.invalidate()
+
+            return result
         except httpx.HTTPError as e:
             logger.error(f"Local API request failed: {e}")
             return None
+
+    @property
+    def cache_stats(self) -> dict:
+        """Return cache statistics for debugging."""
+        return self._cache.stats
 
     async def is_available(self) -> bool:
         """Check if Zotero is running."""
